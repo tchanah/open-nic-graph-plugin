@@ -1,0 +1,14 @@
+# cocotb / iverilog simulation artifacts
+box_250mhz/tb/sim_build/
+box_250mhz/tb/results.xml
+**/__pycache__/
+*.pyc
+
+# capture output
+*.pcap
+
+# Vivado run artifacts
+vivado.jou
+vivado.log
+*.str
+.Xil/

@@ -18,4 +18,5 @@
 if {$num_qdma > 1} {
     source box_250mhz/box_250mhz_axis_switch.tcl
 }
+read_verilog -quiet -sv graph_aggregator.sv
 read_verilog -quiet -sv p2p_250mhz.sv

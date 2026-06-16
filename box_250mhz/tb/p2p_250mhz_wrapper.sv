@@ -185,7 +185,10 @@ module p2p_250mhz_wrapper (
   assign m_axis_qdma_c2h_port1_tuser[47:32] = m_axis_qdma_c2h_tuser_dst[31:16];
 
   p2p_250mhz #(
-    .NUM_INTF (2)
+    .NUM_INTF           (2),
+    // Short idle-flush window so timeout-flush tests run in reasonable
+    // simulation time (synthesis default is 250000 cycles ~ 1 ms).
+    .AGGR_FLUSH_TIMEOUT (256)
   ) p2p_250mhz_inst (
     .s_axil_awvalid                   (s_axil_awvalid),
     .s_axil_awaddr                    (s_axil_awaddr),
