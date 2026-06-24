@@ -7,8 +7,9 @@ box_250mhz/tb/results.xml
 # capture output
 *.pcap
 
-# Vivado run artifacts
-vivado.jou
-vivado.log
+# Vivado run artifacts (incl. timestamped/backup journals from program_fpga.sh)
+vivado*.jou
+vivado*.log
+vivado*.backup.*
 *.str
 .Xil/

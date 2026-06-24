@@ -23,11 +23,14 @@ PROTO = {1: "ICMP", 6: "TCP", 17: "UDP"}
 def fmt_record(rec):
     src = socket.inet_ntoa(rec[0:4])
     dst = socket.inet_ntoa(rec[4:8])
-    sport = int.from_bytes(rec[8:10], "big")
-    dport = int.from_bytes(rec[10:12], "big")
-    proto = rec[12]
-    return "%-15s:%-5d -> %-15s:%-5d  %s" % (
-        src, sport, dst, dport, PROTO.get(proto, "proto=%d" % proto))
+    sport, dport = gc.unpack_ports(rec[8:11])  # FloatingEncoder-decoded
+    proto = rec[11]
+    ttl = rec[12]
+    total_len = int.from_bytes(rec[13:15], "big")
+    flags = rec[15]
+    return "%-15s:%-5d -> %-15s:%-5d  %-4s  ttl=%-3d len=%-5d flags=0x%02x" % (
+        src, sport, dst, dport, PROTO.get(proto, "p%d" % proto),
+        ttl, total_len, flags)
 
 
 def show_frame(idx, raw, verbose):

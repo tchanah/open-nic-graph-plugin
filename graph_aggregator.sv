@@ -20,10 +20,13 @@
 //     bytes 16..19  drop_count (records dropped on FIFO-full since reset)
 //     bytes 20..23  frame_seq  (running frame number, for host loss detection)
 //     byte  24      flags: bit0 = partial/timeout-flushed, bit1 = drops seen
-//     byte  25      header version (0x01)
+//     byte  25      header version (0x02)
 //     bytes 26..31  reserved (zero)
-//   bytes 32..      K x 16-byte records:
-//                   srcIP(4) dstIP(4) srcPort(2) dstPort(2) proto(1) pad(3)
+//   bytes 32..      K x 16-byte records (v2 layout):
+//                   srcIP(4) dstIP(4)
+//                   srcPort/dstPort = two 12-bit FloatingEncoder codes packed
+//                     into 3 bytes (8: src[11:4], 9: {src[3:0],dst[11:8]}, 10: dst[7:0])
+//                   proto(1) TTL(1) totalLen(2 BE) tcpFlags(1)
 //
 // The 32-byte prefix (2 slots) keeps records aligned to the 64-byte beat
 // grid: beat 0 = prefix + 2 records, every following beat = 4 records. The
@@ -79,7 +82,7 @@ module graph_aggregator #(
   localparam int   MAX_BEATS    = (PREFIX_LEN + RECORD_LEN*MAX_RECORDS + 63)/64; // 24
   localparam int   FIFO_AW      = $clog2(RECORD_FIFO_DEPTH);
   localparam int   IDLE_W       = $clog2(FLUSH_TIMEOUT_CYCLES + 1);
-  localparam [7:0] HDR_VERSION  = 8'h01;
+  localparam [7:0] HDR_VERSION  = 8'h02;
 
   // -----------------------------------------------------------------------
   // Extractor: 5-tuple from the first beat of each packet
@@ -97,26 +100,52 @@ module graph_aggregator #(
   end
   wire first_beat = s_axis_tvalid && !in_packet;
 
+  // FloatingEncoder: compress a 16-bit port into a 12-bit float-like code
+  // {exp[1:0], mantissa[9:0]}, value = mantissa << (exp*2). The exponent is the
+  // magnitude of the top set bit; the shift steps by 2 so each exponent spans a
+  // 2-bit window -- test bit pairs, priority high->low. Exact for 0..1023
+  // (well-known ports), floors above that. v==0 lands in the else branch.
+  function automatic [11:0] floating_encode (input [15:0] v);
+    if      (v[15:14] != 2'b0) floating_encode = {2'd3, v[15:6]};
+    else if (v[13:12] != 2'b0) floating_encode = {2'd2, v[13:4]};
+    else if (v[11:10] != 2'b0) floating_encode = {2'd1, v[11:2]};
+    else                       floating_encode = {2'd0, v[9:0]};
+  endfunction
+
   // Byte k of the beat is tdata[8k +: 8]. Untagged frame: ethertype at
   // bytes 12-13, IPv4 header from byte 14, L4 ports from byte 34 (IHL=5).
   wire [15:0] eth_type_w = {s_axis_tdata[8*12 +: 8], s_axis_tdata[8*13 +: 8]};
   wire  [3:0] ip_version = s_axis_tdata[8*14+4 +: 4];
   wire  [3:0] ip_ihl     = s_axis_tdata[8*14 +: 4];
   wire  [7:0] ip_proto   = s_axis_tdata[8*23 +: 8];
+  wire  [7:0] ip_ttl     = s_axis_tdata[8*22 +: 8];           // IPv4 byte 8
 
   wire is_ipv4   = (eth_type_w == 16'h0800) && (ip_version == 4'd4);
   wire ports_ok  = (ip_ihl == 4'd5) && (ip_proto == 8'd6 || ip_proto == 8'd17);
+  wire tcp_ok    = (ip_ihl == 4'd5) && (ip_proto == 8'd6);
+  // TCP flags live at byte 47 (IHL=5): only valid if that byte is present.
+  wire flags_ok  = tcp_ok && (!s_axis_tlast || s_axis_tkeep[47]);
   wire runt_ok   = !s_axis_tlast || s_axis_tkeep[37];  // need bytes 0..37
   wire rec_valid = first_beat && is_ipv4 && runt_ok;
 
-  // Record bytes in network order: byte j of the record is rec[8j +: 8].
-  // srcIP/dstIP and the two ports are contiguous runs in the packet, copied
-  // straight across (no byte swap), so each maps to a single slice.
+  // Ports are big-endian in the packet; assemble MSB-first before encoding.
+  wire [15:0] sport_be = {s_axis_tdata[8*34 +: 8], s_axis_tdata[8*35 +: 8]};
+  wire [15:0] dport_be = {s_axis_tdata[8*36 +: 8], s_axis_tdata[8*37 +: 8]};
+  wire [11:0] sport_fp = ports_ok ? floating_encode(sport_be) : 12'h0;
+  wire [11:0] dport_fp = ports_ok ? floating_encode(dport_be) : 12'h0;
+
+  // v2 16-byte record (network order, byte j = rec[8j +: 8]):
+  //   srcIP(4) dstIP(4) | ports 3B packed | proto(1) TTL(1) totalLen(2) flags(1)
+  // srcIP/dstIP and totalLen are contiguous packet runs copied straight across.
   wire [127:0] rec;
-  assign rec[8*0  +: 64] = s_axis_tdata[8*26 +: 64];                    // srcIP, dstIP
-  assign rec[8*8  +: 32] = ports_ok ? s_axis_tdata[8*34 +: 32] : 32'h0; // srcPort, dstPort
-  assign rec[8*12 +: 8]  = ip_proto;                                    // protocol
-  assign rec[8*13 +: 24] = 24'h0;                                       // pad
+  assign rec[8*0  +: 64] = s_axis_tdata[8*26 +: 64];                   // srcIP, dstIP
+  assign rec[8*8  +: 8]  = sport_fp[11:4];                             // packed ports
+  assign rec[8*9  +: 8]  = {sport_fp[3:0], dport_fp[11:8]};
+  assign rec[8*10 +: 8]  = dport_fp[7:0];
+  assign rec[8*11 +: 8]  = ip_proto;                                   // protocol
+  assign rec[8*12 +: 8]  = ip_ttl;                                     // TTL
+  assign rec[8*13 +: 16] = s_axis_tdata[8*16 +: 16];                   // totalLen (BE)
+  assign rec[8*15 +: 8]  = flags_ok ? s_axis_tdata[8*47 +: 8] : 8'h0;  // TCP flags
 
   // -----------------------------------------------------------------------
   // Record FIFO: simple synchronous show-ahead FIFO (distributed RAM).

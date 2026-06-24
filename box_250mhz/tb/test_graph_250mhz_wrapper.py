@@ -1,13 +1,13 @@
 """Cocotb tests for the graph plugin (p2p_250mhz with graph_aggregator).
 
 RX path (network ingress -> host): packets sent into s_axis_adap_rx are
-parsed; each IPv4 packet yields one 16-byte record
-    srcIP(4) dstIP(4) srcPort(2) dstPort(2) proto(1) pad(3)
+parsed; each IPv4 packet yields one 16-byte record (v2 layout)
+    srcIP(4) dstIP(4) ports(3, FloatingEncoder) proto(1) TTL(1) totalLen(2) flags(1)
 packed into host-bound frames (32-byte prefix = 2 aligned slots):
     bytes 0..13  Ethernet header (DST_MAC, SRC_MAC, ETH_TYPE=0x88B5)
     bytes 14..15 record count K (big-endian)
     bytes 16..19 drop_count   bytes 20..23 frame_seq
-    byte  24     flags (bit0 partial, bit1 drops)   byte 25 version
+    byte  24     flags (bit0 partial, bit1 drops)   byte 25 version (0x02)
     bytes 26..31 reserved
     bytes 32..   K x 16-byte records
 A frame flushes at MAX_RECORDS (91) or after the idle timeout
@@ -34,7 +34,7 @@ AGG_SRC_MAC = bytes.fromhex('02aabbccddee')
 PREFIX_LEN = 32
 RECORD_LEN = 16
 MAX_RECORDS = 91
-HDR_VERSION = 1
+HDR_VERSION = 2
 
 # UDP packet with 128B payload (TX pass-through check)
 PACKET = Ether(src='aa:bb:cc:dd:ee:ff', dst='11:22:33:44:55:66') \
@@ -42,35 +42,73 @@ PACKET = Ether(src='aa:bb:cc:dd:ee:ff', dst='11:22:33:44:55:66') \
     / UDP(sport=11111, dport=22222) / (b'\xaa' * 128)
 
 
+def floating_encode(v):
+    """16-bit value -> 12-bit FloatingEncoder code (mirrors the RTL function)."""
+    v &= 0xFFFF
+    if v & 0xC000:      # bits [15:14]
+        exp, mant = 3, v >> 6
+    elif v & 0x3000:    # bits [13:12]
+        exp, mant = 2, v >> 4
+    elif v & 0x0C00:    # bits [11:10]
+        exp, mant = 1, v >> 2
+    else:               # 0..1023 exact (v==0 lands here)
+        exp, mant = 0, v & 0x3FF
+    return (exp << 10) | (mant & 0x3FF)
+
+
+def floating_decode(code):
+    """12-bit FloatingEncoder code -> value."""
+    exp = (code >> 10) & 0x3
+    return (code & 0x3FF) << (exp * 2)
+
+
+def pack_ports(sport, dport):
+    """Two ports -> the 3 packed record bytes (matches the RTL nibble layout)."""
+    s = floating_encode(sport)
+    d = floating_encode(dport)
+    return bytes([(s >> 4) & 0xFF,
+                  ((s & 0xF) << 4) | ((d >> 8) & 0xF),
+                  d & 0xFF])
+
+
 def make_ipv4_pkt(idx, l4='udp', payload=64):
-    """Synthetic IPv4 packet with a distinctive, index-derived 5-tuple."""
+    """Synthetic IPv4 packet with a distinctive, index-derived 5-tuple.
+
+    Ports span <1024 (FloatingEncoder-exact) and >1023 (quantized); TTL and
+    TCP flags vary per index so the new v2 fields are actually exercised.
+    """
     src_ip = '10.1.{}.{}'.format((idx >> 8) & 0xFF, idx & 0xFF)
     dst_ip = '10.2.{}.{}'.format((idx >> 8) & 0xFF, idx & 0xFF)
-    sport = 1024 + (idx % 60000)
-    dport = 2048 + (idx % 60000)
+    sport = idx % 2000             # mixes exact (<1024) and quantized
+    dport = 1024 + (idx % 4000)    # quantized bands 1-2
+    ttl = 1 + (idx % 254)
     if l4 == 'udp':
         l4_hdr = UDP(sport=sport, dport=dport)
     elif l4 == 'tcp':
-        l4_hdr = TCP(sport=sport, dport=dport)
+        flags = ['S', 'SA', 'A', 'FA', 'PA', 'R'][idx % 6]
+        l4_hdr = TCP(sport=sport, dport=dport, flags=flags)
     else:
         l4_hdr = ICMP()
     pkt = Ether(src='aa:bb:cc:dd:ee:ff', dst='11:22:33:44:55:66') \
-        / IP(src=src_ip, dst=dst_ip) / l4_hdr / (b'\xab' * payload)
+        / IP(src=src_ip, dst=dst_ip, ttl=ttl) / l4_hdr / (b'\xab' * payload)
     # Round-trip through bytes so scapy finalizes lengths/proto fields
     return Ether(bytes(pkt))
 
 
 def expected_record(pkt):
-    """The 16-byte record the aggregator should emit for this packet."""
+    """The 16-byte v2 record the aggregator should emit for this packet."""
     ip = pkt[IP]
     rec = socket.inet_aton(ip.src) + socket.inet_aton(ip.dst)
-    if ip.proto in (6, 17):
+    ports_ok = ip.proto in (6, 17) and ip.ihl == 5
+    if ports_ok:
         l4 = pkt[TCP] if ip.proto == 6 else pkt[UDP]
-        rec += int(l4.sport).to_bytes(2, 'big')
-        rec += int(l4.dport).to_bytes(2, 'big')
+        rec += pack_ports(int(l4.sport), int(l4.dport))
     else:
-        rec += b'\x00' * 4  # ports zeroed for non-TCP/UDP
-    rec += bytes([ip.proto]) + b'\x00' * 3
+        rec += b'\x00' * 3  # ports zeroed for non-TCP/UDP or IHL!=5
+    flags = int(pkt[TCP].flags) & 0xFF if (ip.proto == 6 and ip.ihl == 5) else 0
+    rec += bytes([ip.proto, ip.ttl & 0xFF])     # proto(1) TTL(1)
+    rec += int(ip.len).to_bytes(2, 'big')       # totalLen(2 BE)
+    rec += bytes([flags])                        # tcpFlags(1)
     return rec
 
 
@@ -254,8 +292,16 @@ async def run_test_filtering(dut):
     assert records == expected, 'filtering records mismatch'
 
     icmp_rec = records[2]
-    assert icmp_rec[8:12] == b'\x00' * 4, 'ICMP ports not zeroed'
-    assert icmp_rec[12] == 1, 'ICMP protocol byte wrong'
+    assert icmp_rec[8:11] == b'\x00' * 3, 'ICMP ports not zeroed'
+    assert icmp_rec[11] == 1, 'ICMP protocol byte wrong'
+    assert icmp_rec[12] == icmp[IP].ttl, 'ICMP TTL wrong'
+    assert icmp_rec[13:15] == int(icmp[IP].len).to_bytes(2, 'big'), \
+        'ICMP totalLen wrong'
+    assert icmp_rec[15] == 0, 'ICMP TCP-flags byte not zero'
+
+    tcp_rec = records[3]
+    assert tcp_rec[8:11] != b'\x00' * 3, 'TCP ports unexpectedly zeroed'
+    assert tcp_rec[15] == (int(tcp0[TCP].flags) & 0xFF), 'TCP flags wrong'
 
     await RisingEdge(dut.axis_aclk)
     await RisingEdge(dut.axis_aclk)
