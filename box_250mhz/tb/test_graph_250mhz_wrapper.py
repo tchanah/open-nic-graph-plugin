@@ -112,15 +112,24 @@ def expected_record(pkt):
     return rec
 
 
-async def collect_records(log, sink, n_expected):
-    """Receive aggregated frames until n_expected records are gathered.
+async def collect_records(log, sink, n_expected, allow_drops=False):
+    """Receive aggregated frames until n_expected records/event is reached.
 
-    Asserts per-frame integrity (header fields, count vs length) and
-    returns the concatenated records in arrival order.
+    Asserts per-frame integrity (header fields, count vs length) and returns
+    the concatenated records in arrival order.
+
+    With ``allow_drops=False`` (default) this is the lossless path: it stops
+    once ``n_expected`` records have been gathered and asserts ``drop_count``
+    stays zero. With ``allow_drops=True`` (the overflow stress test) it instead
+    keeps reading until ``delivered + drop_count == n_expected`` (every sent
+    record is accounted for as either delivered or dropped), tolerates the
+    drop-flag / partial-flag, and returns ``(records, final_drop, drop_seen)``.
     """
     records = []
     exp_seq = 0
-    while len(records) < n_expected:
+    final_drop = 0
+    drop_seen = False
+    while True:
         frame = await sink.recv()
         data = bytes(frame.tdata)
         assert len(data) >= PREFIX_LEN, 'frame shorter than prefix'
@@ -139,20 +148,36 @@ async def collect_records(log, sink, n_expected):
         assert len(data) == PREFIX_LEN + RECORD_LEN * count, \
             'frame length does not match record count'
         assert version == HDR_VERSION, 'bad header version'
-        assert drop == 0, 'unexpected dropped records: {}'.format(drop)
         assert data[26:32] == b'\x00' * 6, 'reserved bytes not zero'
-        # flags bit0 = partial (timeout-flushed), bit1 = drops seen
-        assert (flags & 0x01) == (0x01 if count < MAX_RECORDS else 0x00), \
-            'partial flag inconsistent with record count'
-        assert (flags & 0x02) == 0x00, 'drop flag set unexpectedly'
+        # flags bit0 = partial (timeout-flushed), bit1 = drops seen.
+        # frame_seq stays contiguous: frames are never lost on the sink, only
+        # records can be lost inside the FIFO before a frame is built.
         assert seq == exp_seq, \
             'frame_seq gap: got {}, expected {}'.format(seq, exp_seq)
+        if not allow_drops:
+            assert drop == 0, 'unexpected dropped records: {}'.format(drop)
+            assert (flags & 0x01) == (0x01 if count < MAX_RECORDS else 0x00), \
+                'partial flag inconsistent with record count'
+            assert (flags & 0x02) == 0x00, 'drop flag set unexpectedly'
+        else:
+            # drop_count is cumulative; the bit1 flag must track it
+            assert (flags & 0x02) == (0x02 if drop else 0x00), \
+                'drops-seen flag inconsistent with drop_count'
+            final_drop = drop
+            drop_seen = drop_seen or bool(drop)
         exp_seq += 1
         log.info('Frame seq=%d: %d records, %d bytes, drop=%d, flags=0x%02x',
                  seq, count, len(data), drop, flags)
         for j in range(count):
             start = PREFIX_LEN + RECORD_LEN * j
             records.append(data[start:start + RECORD_LEN])
+        if allow_drops:
+            if len(records) + final_drop >= n_expected:
+                break
+        elif len(records) >= n_expected:
+            break
+    if allow_drops:
+        return records, final_drop, drop_seen
     return records
 
 
@@ -311,6 +336,170 @@ def cycle_pause():
     return itertools.cycle([1, 1, 1, 0])
 
 
+def heavy_backpressure():
+    """Mostly-paused C2H sink: ready for 1 cycle out of 16.
+
+    Starves the packetizer DRAIN state so frames leave far slower than records
+    arrive, forcing the 512-deep record FIFO to overflow under a line-rate
+    (1 record/cycle) input.
+    """
+    # cocotbext pause value 1 == stall: ready for 1 cycle out of 16.
+    return itertools.cycle([1] * 15 + [0])
+
+
+async def run_test_overflow(dut):
+    """Line-rate drop-path validation: overflow the record FIFO and check that
+    drop_count is accounted for exactly.
+
+    Drives the RX input back-to-back (no idle = 1 record/cycle, the maximum the
+    hardware can ever see) while heavily backpressuring the C2H sink so the
+    512-deep FIFO overflows. The aggregator must then count every lost record in
+    drop_count. Validated invariants (all cycle-independent):
+      * conservation: delivered_records + final_drop_count == n_sent
+      * overflow actually happened: final_drop_count > 0
+      * drops-seen flag (bit1) tracks drop_count
+      * no corruption: delivered records are an in-order subsequence of the
+        golden records (the FIFO preserves order; drops only remove whichever
+        records arrived while it was full)
+    """
+    tb = TB(dut)
+
+    await tb.reset()
+
+    # No idle inserter -> input runs flat-out at 1 record/cycle.
+    # Heavy backpressure on the sinks -> drain can't keep up -> FIFO overflows.
+    tb.set_backpressure_generator(heavy_backpressure)
+
+    # Min-size IPv4 packets (one 512b beat each) maximise the record rate.
+    # N >> 512 (FIFO depth) guarantees overflow; N << 2**32 so the saturating
+    # drop counter is never pinned.
+    n_pkts = 2000
+    pkts = [make_ipv4_pkt(i, payload=0) for i in range(n_pkts)]
+    expected = [expected_record(p) for p in pkts]
+
+    # Queue every frame up front so the source drives them back-to-back with no
+    # inter-packet idle (send() returns once the frame is enqueued).
+    for pkt in pkts:
+        await tb.source_rx[0].send(AxiStreamFrame(bytes(pkt), tuser=0))
+
+    records, final_drop, drop_seen = await collect_records(
+        tb.log, tb.sink_rx[0], n_pkts, allow_drops=True)
+
+    tb.log.info('Overflow test: sent=%d delivered=%d dropped=%d',
+                n_pkts, len(records), final_drop)
+
+    # Conservation: every sent record is either delivered or counted as dropped.
+    assert len(records) + final_drop == n_pkts, \
+        'record accounting mismatch: {} delivered + {} dropped != {} sent'.format(
+            len(records), final_drop, n_pkts)
+    # The point of the test: backpressure must actually have caused drops.
+    assert final_drop > 0, \
+        'no drops observed - backpressure too light or N too small'
+    assert drop_seen, 'drop_count nonzero but drops-seen flag never set'
+
+    # No corruption: delivered records are an in-order subsequence of the golden
+    # set (FIFO order preserved; overflow only removes records, never reorders or
+    # garbles them).
+    it = iter(records)
+    cur = next(it, None)
+    matched = 0
+    for exp in expected:
+        if cur is not None and cur == exp:
+            matched += 1
+            cur = next(it, None)
+    assert cur is None and matched == len(records), \
+        'delivered records are not an in-order subsequence of the golden set'
+
+    await RisingEdge(dut.axis_aclk)
+    await RisingEdge(dut.axis_aclk)
+
+
+# Sustained-rate cases against an *ideal* (never-backpressured) C2H sink. With
+# the sink always ready, the only thing that can cause a drop is the aggregator's
+# own FILL/PREP/DRAIN overhead -- records are popped from the FIFO only during
+# ST_FILL, so each frame has a fixed no-pop gap (PREP + DRAIN). That overhead is
+# what sets the break-even, which sits at the single-beat (min-size) boundary:
+#   payload -> beats -> input record rate (gap-free)
+#     0   -> 1 beat  (64 B min) -> 1.0  rec/cycle
+#     64  -> 2 beats (128 B)    -> 0.5  rec/cycle
+#     192 -> 4 beats (256 B)    -> 0.25 rec/cycle
+# Any packet carrying a payload (>= 2 beats) halves the record rate or better, so
+# realistic traffic drains with large headroom; only a gap-free flood of true
+# min-size frames can outrun the drain.
+SUSTAINED_CASES = [
+    # Real 100GbE min-size: 1-beat packets paced with the Ethernet inter-frame
+    # gap (~0.6 rec/cycle, i.e. ~149 Mpps at 250 MHz). The headline result --
+    # the datapath sustains line-rate min-size drop-free.
+    dict(label='min64_ifg', payload=0, pause=[1, 1, 0, 0, 0], n=1500,
+         expect_drops=False),
+    # Gap-free min-size (1.0 rec/cycle): exceeds the drain capacity even with an
+    # ideal sink -> drops. Pins the upper side of the break-even / the intrinsic
+    # ceiling. (Harder than the wire can deliver -- real min-size carries IFG.)
+    dict(label='min64_full', payload=0, pause=None, n=4000,
+         expect_drops=True),
+    # 128 B (2 beats) gap-free = 0.5 rec/cycle: just under the break-even -> clean.
+    dict(label='pkt128', payload=64, pause=None, n=1500,
+         expect_drops=False),
+    # 256 B (4 beats) gap-free = 0.25 rec/cycle: typical payload traffic, big
+    # margin -- confirms "we have budget while the rest is going on".
+    dict(label='pkt256', payload=192, pause=None, n=1000,
+         expect_drops=False),
+]
+
+
+async def run_test_sustained(dut, case=SUSTAINED_CASES[0]):
+    """Sustained-rate throughput against an ideal (never-stalled) C2H sink.
+
+    Isolates the aggregator's own throughput from any host-drain limit: confirms
+    the extract/aggregate datapath keeps up with real 100GbE line rate drop-free
+    for payload-bearing traffic, and locates the break-even at the single-beat
+    (min-size) boundary.
+    """
+    tb = TB(dut)
+    await tb.reset()
+
+    # Ideal sink: never backpressure C2H. Optional source-side pause models the
+    # Ethernet inter-frame gap so min-size traffic arrives at the real line rate.
+    if case['pause'] is not None:
+        tb.set_idle_generator(lambda: itertools.cycle(case['pause']))
+
+    n = case['n']
+    pkts = [make_ipv4_pkt(i, payload=case['payload']) for i in range(n)]
+    expected = [expected_record(p) for p in pkts]
+    for pkt in pkts:
+        await tb.source_rx[0].send(AxiStreamFrame(bytes(pkt), tuser=0))
+
+    if case['expect_drops']:
+        records, final_drop, drop_seen = await collect_records(
+            tb.log, tb.sink_rx[0], n, allow_drops=True)
+        tb.log.info('Sustained[%s]: sent=%d delivered=%d dropped=%d',
+                    case['label'], n, len(records), final_drop)
+        assert len(records) + final_drop == n, \
+            '{}: accounting mismatch'.format(case['label'])
+        assert final_drop > 0, \
+            '{}: expected drops at this rate but saw none'.format(case['label'])
+        # delivered records remain an in-order subsequence of the golden set
+        it = iter(records)
+        cur = next(it, None)
+        matched = 0
+        for exp in expected:
+            if cur is not None and cur == exp:
+                matched += 1
+                cur = next(it, None)
+        assert cur is None and matched == len(records), \
+            '{}: delivered records not an in-order subsequence'.format(
+                case['label'])
+    else:
+        records = await collect_records(tb.log, tb.sink_rx[0], n)
+        tb.log.info('Sustained[%s]: sent=%d delivered=%d dropped=0 (drop-free)',
+                    case['label'], n, len(records))
+        assert records == expected, \
+            '{}: aggregated records mismatch'.format(case['label'])
+
+    await RisingEdge(dut.axis_aclk)
+    await RisingEdge(dut.axis_aclk)
+
+
 if cocotb.SIM_NAME:
     factory = TestFactory(run_test)
     factory.add_option('idle_inserter', [None, cycle_pause])
@@ -318,4 +507,11 @@ if cocotb.SIM_NAME:
     factory.generate_tests()
 
     factory = TestFactory(run_test_filtering)
+    factory.generate_tests()
+
+    factory = TestFactory(run_test_overflow)
+    factory.generate_tests()
+
+    factory = TestFactory(run_test_sustained)
+    factory.add_option('case', SUSTAINED_CASES)
     factory.generate_tests()
