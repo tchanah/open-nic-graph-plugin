@@ -118,6 +118,34 @@ def expected_record(i, l4="udp"):
     return rec
 
 
+def record_for_packet(pkt):
+    """The 16-byte v2 record the aggregator should emit for an arbitrary packet.
+
+    Mirrors the RTL extraction (and the cocotb golden model) for a real captured
+    Ether/IP packet rather than a synthetic make_packet(i). Returns None when the
+    plugin would emit no record (non-IPv4), so callers can build an expected list
+    straight from a replayed pcap.
+    """
+    from scapy.all import IP, TCP, UDP
+    if IP not in pkt:
+        return None
+    ip = pkt[IP]
+    if int(ip.version) != 4:
+        return None
+    rec = socket.inet_aton(ip.src) + socket.inet_aton(ip.dst)
+    ports_ok = ip.proto in (6, 17) and ip.ihl == 5
+    if ports_ok:
+        l4h = pkt[TCP] if ip.proto == 6 else pkt[UDP]
+        rec += pack_ports(int(l4h.sport), int(l4h.dport))
+    else:
+        rec += b"\x00" * 3
+    flags = int(pkt[TCP].flags) & 0xFF if (ip.proto == 6 and ip.ihl == 5) else 0
+    rec += bytes([ip.proto, ip.ttl & 0xFF])     # proto(1) TTL(1)
+    rec += int(ip.len).to_bytes(2, "big")       # totalLen(2 BE)
+    rec += bytes([flags])                        # tcpFlags(1)
+    return rec
+
+
 def parse_frame(raw):
     """Parse one captured Ethernet frame; return a dict or None if not ours.
 
