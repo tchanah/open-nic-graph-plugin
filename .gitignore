@@ -13,3 +13,5 @@ vivado*.log
 vivado*.backup.*
 *.str
 .Xil/
+/test/graph_replay
+/test/results/

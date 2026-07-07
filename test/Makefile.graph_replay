@@ -1,0 +1,19 @@
+# Build the streaming replay app against the patched DPDK (same install pktgen uses).
+#   export PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
+#   make -f Makefile.graph_replay
+PKGCONF ?= pkg-config
+APP      = graph_replay
+SRCS     = graph_replay.c
+
+ifeq ($(shell $(PKGCONF) --exists libdpdk && echo y),y)
+CFLAGS  += -O3 -Wall $(shell $(PKGCONF) --cflags libdpdk)
+LDFLAGS += $(shell $(PKGCONF) --libs libdpdk)
+else
+$(error "libdpdk not found by pkg-config -- set PKG_CONFIG_PATH to the DPDK install")
+endif
+
+$(APP): $(SRCS)
+	$(CC) $(CFLAGS) $(SRCS) -o $(APP) $(LDFLAGS)
+
+clean:
+	rm -f $(APP)

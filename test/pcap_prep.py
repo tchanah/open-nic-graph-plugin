@@ -26,13 +26,25 @@ import graph_common as gc
 def main():
     ap = argparse.ArgumentParser(description="Slice + Ethernet-encapsulate a raw-IP pcap")
     ap.add_argument("-i", "--input", required=True, help="source raw-IP pcap")
-    ap.add_argument("-o", "--output", required=True, help="encapsulated Ethernet pcap")
+    ap.add_argument("-o", "--output", help="encapsulated Ethernet pcap (single-slice mode)")
     ap.add_argument("-n", "--count", type=int, default=5000,
-                    help="number of packets to take from the head (default 5000)")
+                    help="total packets to take from the head (default 5000)")
+    ap.add_argument("--split", type=int, default=0, metavar="N",
+                    help="round-robin the packets into N per-queue slices (needs --prefix); "
+                         "for pktgen multi-queue replay: -s 0:<prefix>0.pcap,<prefix>1.pcap,...")
+    ap.add_argument("--prefix",
+                    help="output prefix for --split: writes <prefix>0.pcap .. <prefix>{N-1}.pcap")
     args = ap.parse_args()
 
+    if args.split:
+        if not args.prefix:
+            ap.error("--split requires --prefix")
+    elif not args.output:
+        ap.error("need -o/--output (or --split N --prefix P for per-queue slices)")
+
+    buckets = [[] for _ in range(args.split)] if args.split else None
     frames = []
-    skipped = 0
+    total = skipped = 0
     reader = RawPcapReader(args.input)        # incremental: does not load the file
     try:
         for data, _meta in reader:
@@ -41,20 +53,30 @@ def main():
             except Exception:
                 skipped += 1
                 continue
-            frames.append(Ether(src=gc.INJ_SRC_MAC, dst=gc.INJ_DST_MAC,
-                                type=0x0800) / ip)
-            if len(frames) >= args.count:
+            fr = Ether(src=gc.INJ_SRC_MAC, dst=gc.INJ_DST_MAC, type=0x0800) / ip
+            if args.split:
+                buckets[total % args.split].append(fr)   # round-robin across queues
+            else:
+                frames.append(fr)
+            total += 1
+            if total >= args.count:
                 break
     finally:
         reader.close()
 
-    if not frames:
+    if total == 0:
         print("ERROR: no packets read from %s" % args.input)
         return 1
-    wrpcap(args.output, frames)
-    print("Wrote %d Ethernet-encapsulated packets to %s%s"
-          % (len(frames), args.output,
-             "" if not skipped else " (%d unparseable skipped)" % skipped))
+
+    note = "" if not skipped else " (%d unparseable skipped)" % skipped
+    if args.split:
+        for q in range(args.split):
+            wrpcap("%s%d.pcap" % (args.prefix, q), buckets[q])
+        print("Wrote %d packets round-robin into %d slices %s0.pcap..%s%d.pcap%s"
+              % (total, args.split, args.prefix, args.prefix, args.split - 1, note))
+    else:
+        wrpcap(args.output, frames)
+        print("Wrote %d Ethernet-encapsulated packets to %s%s" % (total, args.output, note))
     return 0
 
 
