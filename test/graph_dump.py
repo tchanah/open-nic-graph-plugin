@@ -17,20 +17,20 @@ import sys
 
 import graph_common as gc
 
-PROTO = {1: "ICMP", 6: "TCP", 17: "UDP"}
+PROTO_CODE = {0x8: "TCP", 0x4: "UDP", 0x2: "ICMP", 0x1: "OTH"}
+FLAG_BITS = [(0x8, "A"), (0x4, "R"), (0x2, "S"), (0x1, "F")]  # ACK RST SYN FIN
+
+
+def fmt_flags(code):
+    return "".join(c for bit, c in FLAG_BITS if code & bit) or "-"
 
 
 def fmt_record(rec):
-    src = socket.inet_ntoa(rec[0:4])
-    dst = socket.inet_ntoa(rec[4:8])
-    sport, dport = gc.unpack_ports(rec[8:11])  # FloatingEncoder-decoded
-    proto = rec[11]
-    ttl = rec[12]
-    total_len = int.from_bytes(rec[13:15], "big")
-    flags = rec[15]
-    return "%-15s:%-5d -> %-15s:%-5d  %-4s  ttl=%-3d len=%-5d flags=0x%02x" % (
-        src, sport, dst, dport, PROTO.get(proto, "p%d" % proto),
-        ttl, total_len, flags)
+    d = gc.decode_record(rec)  # v3: FloatingEncoder ports, 4-bit proto/flags codes
+    return "%-15s:%-5d -> %-15s:%-5d  %-4s  len=%-5d flags=%s" % (
+        d["src"], d["sport"], d["dst"], d["dport"],
+        PROTO_CODE.get(d["proto_code"], "0x%x" % d["proto_code"]),
+        d["length"], fmt_flags(d["flags_code"]))
 
 
 def show_frame(idx, raw, verbose):
@@ -39,9 +39,11 @@ def show_frame(idx, raw, verbose):
         return False
     partial = "partial" if (f["flags"] & 0x01) else "full"
     drops = " DROPS-SEEN" if (f["flags"] & 0x02) else ""
-    print("Frame #%d  seq=%d  count=%d  drop_count=%d  flags=0x%02x(%s%s)  v%d  (%d bytes)"
+    bad = next((r[:8].hex() for r in f["records"] if r[:8] != gc.REC_FIXED), None)
+    tag = "OK" if bad is None else "MISMATCH(%s)" % bad
+    print("Frame #%d  seq=%d  count=%d  drop_count=%d  flags=0x%02x(%s%s)  v%d  tag=%s  (%d bytes)"
           % (idx, f["seq"], f["count"], f["drop"], f["flags"], partial,
-             drops, f["version"], len(raw)))
+             drops, f["version"], tag, len(raw)))
     if verbose:
         for j, rec in enumerate(f["records"]):
             print("    [%3d] %s" % (j, fmt_record(rec)))

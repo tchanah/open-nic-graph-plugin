@@ -3,11 +3,11 @@
 # Vivado must be sourced first (setup-vivado).
 #
 # Usage: ./program_fpga.sh [bitfile]
-#   default bitfile: au250_graph_v2 impl_1 output
+#   default bitfile: au250_graph_v3 impl_1 output
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_BIT="/home/chettige/research/open-nic-shell/build/au250_graph_v2/open_nic_shell/open_nic_shell.runs/impl_1/open_nic_shell.bit"
+DEFAULT_BIT="/home/chettige/research/open-nic-shell/build/au250_graph_v3/open_nic_shell/open_nic_shell.runs/impl_1/open_nic_shell.bit"
 
 export BITFILE="${1:-$DEFAULT_BIT}"
 if [ ! -f "$BITFILE" ]; then

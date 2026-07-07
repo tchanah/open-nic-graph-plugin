@@ -1,16 +1,16 @@
 """Cocotb tests for the graph plugin (p2p_250mhz with graph_aggregator).
 
 RX path (network ingress -> host): packets sent into s_axis_adap_rx are
-parsed; each IPv4 packet yields one 16-byte record (v2 layout)
-    srcIP(4) dstIP(4) ports(3, FloatingEncoder) proto(1) TTL(1) totalLen(2) flags(1)
-packed into host-bound frames (32-byte prefix = 2 aligned slots):
+parsed; each IPv4 packet yields one 32-byte record (v3 layout, big-endian)
+    REC_FIXED(8) srcIP(8) dstIP(8) protoCode|sPort(2) flagsCode|dPort(2) pktLen(4)
+packed into host-bound frames (32-byte prefix = 1 aligned slot):
     bytes 0..13  Ethernet header (DST_MAC, SRC_MAC, ETH_TYPE=0x88B5)
     bytes 14..15 record count K (big-endian)
     bytes 16..19 drop_count   bytes 20..23 frame_seq
-    byte  24     flags (bit0 partial, bit1 drops)   byte 25 version (0x02)
+    byte  24     flags (bit0 partial, bit1 drops)   byte 25 version (0x03)
     bytes 26..31 reserved
-    bytes 32..   K x 16-byte records
-A frame flushes at MAX_RECORDS (91) or after the idle timeout
+    bytes 32..   K x 32-byte records
+A frame flushes at MAX_RECORDS (45) or after the idle timeout
 (AGGR_FLUSH_TIMEOUT=256 cycles in the sim wrapper).
 
 TX path (host -> network) remains pass-through and is checked unchanged.
@@ -32,9 +32,10 @@ AGG_ETH_TYPE = 0x88B5
 AGG_DST_MAC = bytes.fromhex('021122334455')
 AGG_SRC_MAC = bytes.fromhex('02aabbccddee')
 PREFIX_LEN = 32
-RECORD_LEN = 16
-MAX_RECORDS = 91
-HDR_VERSION = 2
+RECORD_LEN = 32
+MAX_RECORDS = 45
+HDR_VERSION = 3
+REC_FIXED = bytes.fromhex("8100FD0000000001")  # MsgHdr tag, record bytes 0-7 (matches graph_aggregator.sv)
 
 # UDP packet with 128B payload (TX pass-through check)
 PACKET = Ether(src='aa:bb:cc:dd:ee:ff', dst='11:22:33:44:55:66') \
@@ -62,13 +63,39 @@ def floating_decode(code):
     return (code & 0x3FF) << (exp * 2)
 
 
-def pack_ports(sport, dport):
-    """Two ports -> the 3 packed record bytes (matches the RTL nibble layout)."""
-    s = floating_encode(sport)
-    d = floating_encode(dport)
-    return bytes([(s >> 4) & 0xFF,
-                  ((s & 0xF) << 4) | ((d >> 8) & 0xF),
-                  d & 0xFF])
+def encode_protocol(proto):
+    """IP protocol number -> 4-bit one-hot code (mirrors the RTL proto_encode)."""
+    return {6: 0x8, 17: 0x4, 1: 0x2}.get(proto, 0x1)
+
+
+def encode_tcp_flags(flags):
+    """TCP flag byte -> 4-bit {ACK,RST,SYN,FIN} code (mirrors the RTL flags_encode)."""
+    code = 0
+    if flags & 0x10:
+        code |= 0x8   # ACK
+    if flags & 0x04:
+        code |= 0x4   # RST
+    if flags & 0x02:
+        code |= 0x2   # SYN
+    if flags & 0x01:
+        code |= 0x1   # FIN
+    return code
+
+
+def build_record(src_ip, dst_ip, proto, ip_len, sport, dport, tcp_flags,
+                 ports_ok, flags_ok):
+    """Assemble one 32-byte v3 record (matches graph_aggregator.sv byte layout)."""
+    proto_code = encode_protocol(proto)
+    sfp = floating_encode(sport) if ports_ok else 0
+    dfp = floating_encode(dport) if ports_ok else 0
+    fcode = encode_tcp_flags(tcp_flags) if flags_ok else 0
+    rec = bytearray(REC_FIXED)                                    # 0-7   fixed tag
+    rec += b'\x00\x00\x00\x00' + socket.inet_aton(src_ip)         # 8-15  srcIP (BE)
+    rec += b'\x00\x00\x00\x00' + socket.inet_aton(dst_ip)         # 16-23 dstIP (BE)
+    rec += bytes([(proto_code << 4) | ((sfp >> 8) & 0xF), sfp & 0xFF,   # 24-25 word A
+                  (fcode << 4) | ((dfp >> 8) & 0xF), dfp & 0xFF])       # 26-27 word B
+    rec += b'\x00\x00' + int(ip_len).to_bytes(2, 'big')          # 28-31 pktLen (BE)
+    return bytes(rec)
 
 
 def make_ipv4_pkt(idx, l4='udp', payload=64):
@@ -96,20 +123,18 @@ def make_ipv4_pkt(idx, l4='udp', payload=64):
 
 
 def expected_record(pkt):
-    """The 16-byte v2 record the aggregator should emit for this packet."""
+    """The 32-byte v3 record the aggregator should emit for this packet."""
     ip = pkt[IP]
-    rec = socket.inet_aton(ip.src) + socket.inet_aton(ip.dst)
     ports_ok = ip.proto in (6, 17) and ip.ihl == 5
+    flags_ok = ip.proto == 6 and ip.ihl == 5
     if ports_ok:
         l4 = pkt[TCP] if ip.proto == 6 else pkt[UDP]
-        rec += pack_ports(int(l4.sport), int(l4.dport))
+        sport, dport = int(l4.sport), int(l4.dport)
     else:
-        rec += b'\x00' * 3  # ports zeroed for non-TCP/UDP or IHL!=5
-    flags = int(pkt[TCP].flags) & 0xFF if (ip.proto == 6 and ip.ihl == 5) else 0
-    rec += bytes([ip.proto, ip.ttl & 0xFF])     # proto(1) TTL(1)
-    rec += int(ip.len).to_bytes(2, 'big')       # totalLen(2 BE)
-    rec += bytes([flags])                        # tcpFlags(1)
-    return rec
+        sport = dport = 0  # ports zeroed for non-TCP/UDP or IHL!=5
+    tcp_flags = int(pkt[TCP].flags) & 0xFF if flags_ok else 0
+    return build_record(ip.src, ip.dst, ip.proto, ip.len, sport, dport,
+                        tcp_flags, ports_ok, flags_ok)
 
 
 async def collect_records(log, sink, n_expected, allow_drops=False):
@@ -271,8 +296,8 @@ async def run_test(dut, idle_inserter=None, backpressure_inserter=None):
     await check_passthrough(tb, tb.source_tx[0], tb.sink_tx[0], PACKET)
     await check_passthrough(tb, tb.source_tx[1], tb.sink_tx[1], PACKET)
 
-    # RX path (network -> host) aggregates: 200 packets = two full frames
-    # of 91 records plus an 18-record tail flushed by the idle timeout
+    # RX path (network -> host) aggregates: 200 packets = four full frames
+    # of 45 records plus a 20-record tail flushed by the idle timeout
     n_pkts = 200
     pkts = [make_ipv4_pkt(i) for i in range(n_pkts)]
     expected = [expected_record(p) for p in pkts]
@@ -316,17 +341,19 @@ async def run_test_filtering(dut):
     records = await collect_records(tb.log, tb.sink_rx[0], len(expected))
     assert records == expected, 'filtering records mismatch'
 
+    # v3 record: proto/flags are 4-bit codes in the high nibble of bytes 24/26;
+    # ports (12-bit FloatingEncoder) fill the rest of bytes 24-27; len at 28-31.
     icmp_rec = records[2]
-    assert icmp_rec[8:11] == b'\x00' * 3, 'ICMP ports not zeroed'
-    assert icmp_rec[11] == 1, 'ICMP protocol byte wrong'
-    assert icmp_rec[12] == icmp[IP].ttl, 'ICMP TTL wrong'
-    assert icmp_rec[13:15] == int(icmp[IP].len).to_bytes(2, 'big'), \
-        'ICMP totalLen wrong'
-    assert icmp_rec[15] == 0, 'ICMP TCP-flags byte not zero'
+    assert (icmp_rec[24] >> 4) == encode_protocol(1), 'ICMP proto code wrong'
+    assert icmp_rec[24:28] == bytes([0x20, 0, 0, 0]), 'ICMP ports/flags not zeroed'
+    assert icmp_rec[28:32] == int(icmp[IP].len).to_bytes(4, 'big'), \
+        'ICMP pktLen wrong'
 
     tcp_rec = records[3]
-    assert tcp_rec[8:11] != b'\x00' * 3, 'TCP ports unexpectedly zeroed'
-    assert tcp_rec[15] == (int(tcp0[TCP].flags) & 0xFF), 'TCP flags wrong'
+    assert (tcp_rec[24] >> 4) == encode_protocol(6), 'TCP proto code wrong'
+    assert tcp_rec[24:28] != bytes([0x80, 0, 0, 0]), 'TCP ports unexpectedly zeroed'
+    assert (tcp_rec[26] >> 4) == encode_tcp_flags(int(tcp0[TCP].flags) & 0xFF), \
+        'TCP flags code wrong'
 
     await RisingEdge(dut.axis_aclk)
     await RisingEdge(dut.axis_aclk)

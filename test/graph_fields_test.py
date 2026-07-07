@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Focused field-extraction test for graph plugin v2.
+"""Focused field-extraction test for graph plugin v3.
 
 Unlike run_graph_test.sh (bulk 5-tuple aggregation, fixed length / UDP), this
-injects a *small, deliberately varied* set of packets to confirm the new v2
+injects a *small, deliberately varied* set of packets to confirm the v3
 record fields are extracted correctly on hardware:
 
-  - tcpFlags : SYN, SYN-ACK, ACK, FIN-ACK, PSH-ACK, RST, FIN-PSH-URG, none,
-               and 0 for UDP/ICMP
-  - totalLen : sweeps 28..1440 bytes, crossing the 255/256 byte boundary so
+  - protoCode: 4-bit one-hot TCP/UDP/ICMP/other
+  - flagsCode: 4-bit {ACK,RST,SYN,FIN} (only the retained flags), 0 for UDP/ICMP
+  - pktLen   : sweeps 28..1440 bytes, crossing the 255/256 byte boundary so
                both length bytes are exercised
-  - TTL      : 1, 32, 64, 77, 100, 128, 200, 254, 255
   - ports    : FloatingEncoder round-trip (exact <1024, quantized above)
+  (TTL is no longer extracted in v3; packets still vary it for realism.)
 
 Each packet gets a unique src IP (10.77.0.<i>) so captured records map back to
 the injected case regardless of ordering or stray kernel traffic. Per-field
@@ -68,24 +68,24 @@ def expected_fields(i):
     pkt = make_pkt(i)
     ip = pkt[IP]
     tcp_or_udp = ip.proto in (6, 17) and ip.ihl == 5
+    flags_ok = ip.proto == 6 and ip.ihl == 5
     if tcp_or_udp:
         l4 = pkt[TCP] if ip.proto == 6 else pkt[UDP]
         sport = gc.floating_decode(gc.floating_encode(int(l4.sport)))
         dport = gc.floating_decode(gc.floating_encode(int(l4.dport)))
     else:
         sport = dport = 0
-    flags = int(pkt[TCP].flags) & 0xFF if (ip.proto == 6 and ip.ihl == 5) else 0
-    return dict(src=ip.src, dst=ip.dst, proto=ip.proto, ttl=ip.ttl & 0xFF,
-                length=int(ip.len), flags=flags, sport=sport, dport=dport)
+    flags_code = gc.encode_tcp_flags(int(pkt[TCP].flags) & 0xFF) if flags_ok else 0
+    return dict(src=ip.src, dst=ip.dst, proto_code=gc.encode_protocol(ip.proto),
+                length=int(ip.len), flags_code=flags_code, sport=sport, dport=dport)
 
 
 def decode_record(rec):
-    """Decode a captured 16-byte v2 record into the same field dict."""
-    sport, dport = gc.unpack_ports(rec[8:11])
-    return dict(src=socket.inet_ntoa(rec[0:4]), dst=socket.inet_ntoa(rec[4:8]),
-                proto=rec[11], ttl=rec[12],
-                length=int.from_bytes(rec[13:15], "big"), flags=rec[15],
-                sport=sport, dport=dport)
+    """Decode a captured 32-byte v3 record into the comparable field dict."""
+    d = gc.decode_record(rec)
+    return dict(src=d["src"], dst=d["dst"], proto_code=d["proto_code"],
+                length=d["length"], flags_code=d["flags_code"],
+                sport=d["sport"], dport=d["dport"])
 
 
 def do_inject(iface):
@@ -113,10 +113,10 @@ def do_verify(pcap):
             d = decode_record(rec)
             by_src.setdefault(d["src"], d)  # first occurrence wins
 
-    fields = ("proto", "ttl", "length", "flags", "sport", "dport")
+    fields = ("proto_code", "length", "flags_code", "sport", "dport")
     ok = True
-    print("%-11s %-5s %-4s %-6s %-6s %-6s %-6s  result"
-          % ("src", "proto", "ttl", "len", "flags", "sport", "dport"))
+    print("%-11s %-5s %-6s %-6s %-6s %-6s  result"
+          % ("src", "proto", "len", "flags", "sport", "dport"))
     for i in range(len(CASES)):
         exp = expected_fields(i)
         got = by_src.get(exp["src"])
@@ -126,12 +126,12 @@ def do_verify(pcap):
             continue
         bad = [f for f in fields if exp[f] != got[f]]
         status = "OK" if not bad else "MISMATCH:%s" % ",".join(bad)
-        print("%-11s %-5d %-4d %-6d 0x%02x   %-6d %-6d  %s"
-              % (exp["src"], got["proto"], got["ttl"], got["length"],
-                 got["flags"], got["sport"], got["dport"], status))
+        print("%-11s 0x%-3x %-6d 0x%-4x %-6d %-6d  %s"
+              % (exp["src"], got["proto_code"], got["length"],
+                 got["flags_code"], got["sport"], got["dport"], status))
         if bad:
             for f in bad:
-                print("      %-7s expected %s, got %s" % (f, exp[f], got[f]))
+                print("      %-10s expected %s, got %s" % (f, exp[f], got[f]))
             ok = False
 
     print()

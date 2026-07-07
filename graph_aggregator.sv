@@ -20,16 +20,19 @@
 //     bytes 16..19  drop_count (records dropped on FIFO-full since reset)
 //     bytes 20..23  frame_seq  (running frame number, for host loss detection)
 //     byte  24      flags: bit0 = partial/timeout-flushed, bit1 = drops seen
-//     byte  25      header version (0x02)
+//     byte  25      header version (0x03)
 //     bytes 26..31  reserved (zero)
-//   bytes 32..      K x 16-byte records (v2 layout):
-//                   srcIP(4) dstIP(4)
-//                   srcPort/dstPort = two 12-bit FloatingEncoder codes packed
-//                     into 3 bytes (8: src[11:4], 9: {src[3:0],dst[11:8]}, 10: dst[7:0])
-//                   proto(1) TTL(1) totalLen(2 BE) tcpFlags(1)
+//   bytes 32..      K x 32-byte records (v3 layout, all big-endian):
+//                   REC_FIXED(8)  fixed tag, user-assigned
+//                   srcIP(8) dstIP(8)  32-bit IPv4 right-aligned in a 64-bit field
+//                     (high 4 bytes zero) for the gmap/GraphBLAS index
+//                   word A = protoCode(4b) | srcPort(12b FloatingEncoder)
+//                   word B = flagsCode(4b) | dstPort(12b FloatingEncoder)
+//                   pktLen(4)  IP totalLen right-aligned in a 32-bit field
+//                   protoCode one-hot {TCP,UDP,ICMP,other}; flagsCode {ACK,RST,SYN,FIN}
 //
-// The 32-byte prefix (2 slots) keeps records aligned to the 64-byte beat
-// grid: beat 0 = prefix + 2 records, every following beat = 4 records. The
+// The 32-byte prefix (1 record slot) keeps records aligned to the 64-byte beat
+// grid: beat 0 = prefix + 1 record, every following beat = 2 records. The
 // status descriptor lets downstream stages (traffic-matrix construction)
 // order frames, detect loss, and gauge data completeness.
 //
@@ -53,7 +56,11 @@ module graph_aggregator #(
   parameter int        RECORD_FIFO_DEPTH    = 512,     // power of 2
   parameter bit [47:0] ETH_DST_MAC          = 48'h02_11_22_33_44_55,
   parameter bit [47:0] ETH_SRC_MAC          = 48'h02_AA_BB_CC_DD_EE,
-  parameter bit [15:0] ETH_TYPE             = 16'h88B5 // local experimental
+  parameter bit [15:0] ETH_TYPE             = 16'h88B5, // local experimental
+  // v3 record bytes 0-7: fixed MsgHdr tag, big-endian (record byte 0 = REC_FIXED[63:56]),
+  // so the constant reads left-to-right on the wire. 0x81 00 FD 00 00 00 00 01 =
+  // {msg_type=1,route_type=8} msg_flags=0 payload_type=0xFD tuple_type=0 pid=0 act=1.
+  parameter bit [63:0] REC_FIXED            = 64'h8100_FD00_0000_0001
 ) (
   input          s_axis_tvalid,
   input  [511:0] s_axis_tdata,
@@ -75,14 +82,14 @@ module graph_aggregator #(
   input          aresetn
 );
 
-  localparam int   PREFIX_LEN   = 32;  // slot 0 = link header, slot 1 = descriptor
-  localparam int   RECORD_LEN   = 16;
-  localparam int   PREFIX_SLOTS = PREFIX_LEN / RECORD_LEN;                       // 2
-  localparam int   MAX_RECORDS  = (MAX_FRAME_LEN - PREFIX_LEN) / RECORD_LEN;     // 91
-  localparam int   MAX_BEATS    = (PREFIX_LEN + RECORD_LEN*MAX_RECORDS + 63)/64; // 24
+  localparam int   PREFIX_LEN   = 32;  // link header (0..15) + status descriptor (16..31)
+  localparam int   RECORD_LEN   = 32;
+  localparam int   PREFIX_SLOTS = PREFIX_LEN / RECORD_LEN;                       // 1
+  localparam int   MAX_RECORDS  = (MAX_FRAME_LEN - PREFIX_LEN) / RECORD_LEN;     // 45
+  localparam int   MAX_BEATS    = (PREFIX_LEN + RECORD_LEN*MAX_RECORDS + 63)/64; // 23
   localparam int   FIFO_AW      = $clog2(RECORD_FIFO_DEPTH);
   localparam int   IDLE_W       = $clog2(FLUSH_TIMEOUT_CYCLES + 1);
-  localparam [7:0] HDR_VERSION  = 8'h02;
+  localparam [7:0] HDR_VERSION  = 8'h03;
 
   // -----------------------------------------------------------------------
   // Extractor: 5-tuple from the first beat of each packet
@@ -112,13 +119,27 @@ module graph_aggregator #(
     else                       floating_encode = {2'd0, v[9:0]};
   endfunction
 
+  // v3 protocol code: 4-bit one-hot (mirrors host encode_protocol_bits >> 12).
+  function automatic [3:0] proto_encode (input [7:0] p);
+    case (p)
+      8'd6:    proto_encode = 4'b1000;  // TCP
+      8'd17:   proto_encode = 4'b0100;  // UDP
+      8'd1:    proto_encode = 4'b0010;  // ICMP
+      default: proto_encode = 4'b0001;  // other
+    endcase
+  endfunction
+
+  // v3 TCP-flags code: {ACK,RST,SYN,FIN} (mirrors host encode_tcp_flags >> 12).
+  function automatic [3:0] flags_encode (input [7:0] f);
+    flags_encode = {f[4], f[2], f[1], f[0]};  // ACK=0x10 RST=0x04 SYN=0x02 FIN=0x01
+  endfunction
+
   // Byte k of the beat is tdata[8k +: 8]. Untagged frame: ethertype at
   // bytes 12-13, IPv4 header from byte 14, L4 ports from byte 34 (IHL=5).
   wire [15:0] eth_type_w = {s_axis_tdata[8*12 +: 8], s_axis_tdata[8*13 +: 8]};
   wire  [3:0] ip_version = s_axis_tdata[8*14+4 +: 4];
   wire  [3:0] ip_ihl     = s_axis_tdata[8*14 +: 4];
   wire  [7:0] ip_proto   = s_axis_tdata[8*23 +: 8];
-  wire  [7:0] ip_ttl     = s_axis_tdata[8*22 +: 8];           // IPv4 byte 8
 
   wire is_ipv4   = (eth_type_w == 16'h0800) && (ip_version == 4'd4);
   wire ports_ok  = (ip_ihl == 4'd5) && (ip_proto == 8'd6 || ip_proto == 8'd17);
@@ -134,32 +155,45 @@ module graph_aggregator #(
   wire [11:0] sport_fp = ports_ok ? floating_encode(sport_be) : 12'h0;
   wire [11:0] dport_fp = ports_ok ? floating_encode(dport_be) : 12'h0;
 
-  // v2 16-byte record (network order, byte j = rec[8j +: 8]):
-  //   srcIP(4) dstIP(4) | ports 3B packed | proto(1) TTL(1) totalLen(2) flags(1)
-  // srcIP/dstIP and totalLen are contiguous packet runs copied straight across.
-  wire [127:0] rec;
-  assign rec[8*0  +: 64] = s_axis_tdata[8*26 +: 64];                   // srcIP, dstIP
-  assign rec[8*8  +: 8]  = sport_fp[11:4];                             // packed ports
-  assign rec[8*9  +: 8]  = {sport_fp[3:0], dport_fp[11:8]};
-  assign rec[8*10 +: 8]  = dport_fp[7:0];
-  assign rec[8*11 +: 8]  = ip_proto;                                   // protocol
-  assign rec[8*12 +: 8]  = ip_ttl;                                     // TTL
-  assign rec[8*13 +: 16] = s_axis_tdata[8*16 +: 16];                   // totalLen (BE)
-  assign rec[8*15 +: 8]  = flags_ok ? s_axis_tdata[8*47 +: 8] : 8'h0;  // TCP flags
+  // v3 32-byte record (network order, byte j = rec[8j +: 8]):
+  //   REC_FIXED(8) srcIP64(8) dstIP64(8) | protoCode|sPort, flagsCode|dPort (4) | pktLen32(4)
+  // IPs and pktLen are right-aligned big-endian (value in the low bytes, high bytes zero).
+  wire [3:0]  proto_fp = proto_encode(ip_proto);
+  wire [3:0]  flags_fp = flags_ok ? flags_encode(s_axis_tdata[8*47 +: 8]) : 4'h0;
+
+  wire [255:0] rec;
+  assign rec[8*0  +: 8]  = REC_FIXED[63:56];                   // byte 0  MsgHdr tag (big-endian)
+  assign rec[8*1  +: 8]  = REC_FIXED[55:48];                   // byte 1
+  assign rec[8*2  +: 8]  = REC_FIXED[47:40];                   // byte 2
+  assign rec[8*3  +: 8]  = REC_FIXED[39:32];                   // byte 3
+  assign rec[8*4  +: 8]  = REC_FIXED[31:24];                   // byte 4
+  assign rec[8*5  +: 8]  = REC_FIXED[23:16];                   // byte 5
+  assign rec[8*6  +: 8]  = REC_FIXED[15:8];                    // byte 6
+  assign rec[8*7  +: 8]  = REC_FIXED[7:0];                     // byte 7
+  assign rec[8*8  +: 32] = 32'h0;                              // bytes 8-11  srcIP high pad
+  assign rec[8*12 +: 32] = s_axis_tdata[8*26 +: 32];          // bytes 12-15 srcIP (BE)
+  assign rec[8*16 +: 32] = 32'h0;                              // bytes 16-19 dstIP high pad
+  assign rec[8*20 +: 32] = s_axis_tdata[8*30 +: 32];          // bytes 20-23 dstIP (BE)
+  assign rec[8*24 +: 8]  = {proto_fp, sport_fp[11:8]};        // byte 24     word A high
+  assign rec[8*25 +: 8]  = sport_fp[7:0];                      // byte 25     word A low
+  assign rec[8*26 +: 8]  = {flags_fp, dport_fp[11:8]};        // byte 26     word B high
+  assign rec[8*27 +: 8]  = dport_fp[7:0];                      // byte 27     word B low
+  assign rec[8*28 +: 16] = 16'h0;                             // bytes 28-29 pktLen high pad
+  assign rec[8*30 +: 16] = s_axis_tdata[8*16 +: 16];         // bytes 30-31 pktLen = totalLen (BE)
 
   // -----------------------------------------------------------------------
   // Record FIFO: simple synchronous show-ahead FIFO (distributed RAM).
   // Hand-rolled instead of xpm_fifo_sync so simulation does not depend on
   // the Vivado XPM libraries.
   // -----------------------------------------------------------------------
-  reg  [127:0] fifo_mem [0:RECORD_FIFO_DEPTH-1];
+  reg  [255:0] fifo_mem [0:RECORD_FIFO_DEPTH-1];
   reg  [FIFO_AW:0] fifo_wr_ptr, fifo_rd_ptr;
 
   wire fifo_full  = (fifo_wr_ptr - fifo_rd_ptr) == RECORD_FIFO_DEPTH[FIFO_AW:0];
   wire fifo_empty = fifo_wr_ptr == fifo_rd_ptr;
   wire fifo_push  = rec_valid && !fifo_full;
   wire fifo_pop;
-  wire [127:0] fifo_dout = fifo_mem[fifo_rd_ptr[FIFO_AW-1:0]];
+  wire [255:0] fifo_dout = fifo_mem[fifo_rd_ptr[FIFO_AW-1:0]];
 
   always @(posedge aclk) begin
     if (!aresetn) begin
@@ -190,8 +224,8 @@ module graph_aggregator #(
 
   // -----------------------------------------------------------------------
   // Packetizer: fill the frame buffer one record per cycle, then drain it
-  // to the host. Record k lives at frame bytes 16+16k, i.e. 16-byte slot
-  // (k+1): beat (k+1)/4, slot (k+1)%4 -- the prefix occupies slot 0.
+  // to the host. Record k lives at frame bytes 32+32k, i.e. 32-byte slot
+  // (k+1): beat (k+1)/2, slot (k+1)%2 -- the prefix occupies slot 0.
   // -----------------------------------------------------------------------
   localparam [1:0] ST_FILL  = 2'd0,
                    ST_PREP  = 2'd1,
@@ -207,14 +241,14 @@ module graph_aggregator #(
   reg       [31:0] frame_cnt;
 
   wire [6:0] slot_lin = rec_cnt + PREFIX_SLOTS[6:0];  // records start after prefix
-  wire [4:0] wr_beat  = slot_lin[6:2];
-  wire [1:0] wr_slot  = slot_lin[1:0];
+  wire [4:0] wr_beat  = slot_lin[5:1];                // 2 x 256b slots per 512b beat
+  wire       wr_slot  = slot_lin[0];
 
   assign fifo_pop = (state == ST_FILL) && !fifo_empty
                     && (rec_cnt < MAX_RECORDS[6:0]);
 
   wire [15:0] rec_cnt_w   = {9'd0, rec_cnt};
-  wire [15:0] frame_len_w = PREFIX_LEN[15:0] + {rec_cnt_w[11:0], 4'd0};  // 32 + 16K
+  wire [15:0] frame_len_w = PREFIX_LEN[15:0] + {rec_cnt_w[10:0], 5'd0};  // 32 + 32K
 
   wire drain_done = (state == ST_DRAIN) && m_axis_tready
                     && (beat_idx == last_beat);
@@ -238,7 +272,7 @@ module graph_aggregator #(
       case (state)
         ST_FILL: begin
           if (fifo_pop) begin
-            frame_buf[wr_beat][128*wr_slot +: 128] <= fifo_dout;
+            frame_buf[wr_beat][256*wr_slot +: 256] <= fifo_dout;
             rec_cnt  <= rec_cnt + 1'b1;
             idle_cnt <= '0;
           end
