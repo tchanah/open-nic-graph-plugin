@@ -10,7 +10,8 @@ aggregates many compact records into host-bound `0x88B5` frames via QDMA C2H.
 hardware-verified, and throughput-validated on the real datapath:
 - multi-queue **≥100 Mpps min-size, drop-free** (host/PCIe-limited; plugin ~163 Mpps in sim);
 - the full **60 GB real scan trace — all 1,073,741,824 packets — streamed drop-free**
-  (`drop_count=0`, tag OK, `frame_seq` contiguous).
+  (`drop_count=0`, tag OK, `frame_seq` contiguous), in one pass at **13.25 Mpps / 81 s** via
+  the lz4-in-RAM, multi-queue `graph_replay` streamer (≈4× the raw-HDD baseline).
 
 > **Detailed, reproducible step-by-step guides live in the [wiki](../../wiki)** — this README
 > is the concise overview + pointers:
@@ -84,10 +85,12 @@ cd test
 NUMQ=8 ./onic_dpdk_reinit.sh                           # multi-queue steering + DPDK env
 # real trace at ~100 Mpps: split per queue, pktgen -s 0:mq_0.pcap,mq_1.pcap,...
 ./pcap_prep.py -i <trace>.pcap --split 8 --prefix /scratch/data/mq_ -n 1600000
-# whole 60 GB in one streaming pass (drop_count checked live):
-make -f Makefile.graph_replay && NUMQ=1 ./onic_dpdk_reinit.sh
-sudo ./graph_replay -l 4-6 -n 4 -a 0000:17:00.0 -a 0000:17:00.1 -d librte_net_qdma.so -- \
-     <trace>.pcap [out.pcap]
+# whole 57 GB in one streaming pass at ~13 Mpps (lz4-in-RAM, every frame verified live):
+lz4 -1 /scratch/data/<trace>.pcap /scratch/data/trace.lz4   # compress once (kept on /scratch)
+cp /scratch/data/trace.lz4 /dev/shm/                        # stage in RAM once per boot
+make -f Makefile.graph_replay && NUMQ=4 HUGEPAGES=4096 ./onic_dpdk_reinit.sh
+lz4 -dc /dev/shm/trace.lz4 | sudo NQ=4 ./graph_replay -l 4-9 -n 4 \
+     -a 0000:17:00.0 -a 0000:17:00.1 -d librte_net_qdma.so -- -
 ```
 
 ## Test tooling (`test/`)
@@ -101,7 +104,7 @@ sudo ./graph_replay -l 4-6 -n 4 -a 0000:17:00.0 -a 0000:17:00.1 -d librte_net_qd
 | `graph_dump.py` | pretty-print `0x88B5` frames (decodes records, checks `tag=OK`) |
 | `pcap_prep.py` | slice + Ethernet-encapsulate a raw-IP pcap; `--split N` writes per-queue slices |
 | `onic_dpdk_reinit.sh` | DPDK per-run: restore vfio/hugepages/steering (`NUMQ=N` for multi-queue) |
-| `graph_replay.c` · `Makefile.graph_replay` | DPDK streaming replay of a whole (>RAM) pcap; verifies every frame live |
+| `graph_replay.c` · `Makefile.graph_replay` | DPDK streaming replay of a whole (>RAM) pcap — reads a path or stdin (`-`, e.g. `lz4 -dc … \|`), multi-queue TX (`NQ=N`); verifies every frame live |
 | `graph_agg_check.py` | stream-validate a large (tens-of-GB) recorded `0x88B5` pcap (no scapy, no OOM) |
 
 ## Notes
