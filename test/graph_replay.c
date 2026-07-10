@@ -15,8 +15,13 @@
  *
  * Throughput: NQ (env, default 1) TX queues. One READER lcore parses the pipe and
  * round-robins packet refs to NQ WORKER lcores that each encapsulate + TX on their own
- * queue; the MAIN lcore drains + verifies the (45x fewer) C2H frames on a single RX
- * queue. Single-queue (NQ=1) reproduces the original disk-bound behaviour.
+ * queue (each from its OWN mempool -- no cross-core pool contention); the MAIN lcore
+ * drains + verifies the (45x fewer) C2H frames on a single RX queue from its own pool.
+ * Single-queue (NQ=1) reproduces the original disk-bound behaviour.
+ *
+ * Diagnostics: STUB=1 (env) makes workers drop refs without encap/alloc/TX, isolating the
+ * reader+dispatch (pipe/parse) throughput from the TX/mempool path. If reader+stub clears
+ * the lz4-decode ceiling, the wall is on the TX side; if it caps low, the front-end is it.
  *
  * Topology (same as the pktgen loopback): PF0 TX -> CMAC0 -> QSFP0 ==loop== QSFP1
  *   -> CMAC1 RX -> plugin -> QDMA C2H -> PF1 RX (this app drains + checks).
@@ -48,13 +53,14 @@
 #define PORT_TX        0
 #define PORT_RX        1
 #define NB_DESC        1024
-#define NUM_MBUFS      65536
+#define NUM_MBUFS_RX   32768            /* RX/drain pool (main lcore frees here) */
+#define NUM_MBUFS_TX   16384            /* per-worker TX pool: own pool => no cross-core contention */
 #define MBUF_CACHE     512
 #define BURST          64
 #define MBUF_DATAROOM  (RTE_PKTMBUF_HEADROOM + 2048)   /* min-size frames; no jumbo */
 
 #define NQ_MAX         16
-#define NBLK           8                 /* stdin read buffers (must fit blk field, 3 bits) */
+#define NBLK           32                /* stdin read buffers (power of 2; blk field: 5 bits) */
 #define BLKSZ          (8u << 20)        /* 8 MB per block (off field: 23 bits) */
 #define RING_SZ        8192              /* per-worker ref ring (power of 2) */
 
@@ -79,11 +85,13 @@ static void on_sig(int s) { (void)s; force_quit = 1; }
 static FILE *out_f = NULL;                 /* optional: record aggregated frames */
 
 /* ---- shared state between lcores ---- */
-static struct rte_mempool *g_mp;
+static struct rte_mempool *g_mp_rx;          /* RX/drain pool (main lcore frees here) */
+static struct rte_mempool *g_mp_tx[NQ_MAX];  /* per-worker TX pools (no cross-core mempool contention) */
 static struct rte_ring   *g_ring[NQ_MAX];  /* reader -> worker[q] packet refs */
 static uint8_t           *g_blk[NBLK];     /* reader's stdin parse buffers */
 static int                g_blk_out[NBLK]; /* outstanding refs per block (atomic) */
 static int                g_nq = 1;
+static int                g_stub = 0;      /* STUB=1: workers drop refs w/o encap+TX (reader isolation) */
 static int                g_swap = 0;
 static volatile int       g_reader_done = 0;
 static volatile int       g_workers_live = 0;
@@ -176,6 +184,7 @@ static int tx_worker(void *arg)
 {
     unsigned qid = (unsigned)(uintptr_t)arg;
     struct rte_ring *r = g_ring[qid];
+    struct rte_mempool *mp = g_mp_tx[qid];        /* this worker's own pool */
     void *refs[BURST];
     struct rte_mbuf *tx[BURST];
     uint64_t sent = 0;
@@ -187,8 +196,17 @@ static int tx_worker(void *arg)
             rte_pause();
             continue;
         }
-        /* one bulk alloc for the whole burst (65 K pool >> in-flight, so this rarely waits) */
-        while (rte_pktmbuf_alloc_bulk(g_mp, tx, n) != 0) {
+        if (g_stub) {                                /* reader-isolation: drop refs, no encap/alloc/TX */
+            for (unsigned i = 0; i < n; i++) {
+                unsigned blk = ((uintptr_t)refs[i] >> 40) & (NBLK - 1);
+                __atomic_fetch_sub(&g_blk_out[blk], 1, __ATOMIC_RELEASE);
+            }
+            sent += n;
+            g_w_sent[qid] = sent;
+            continue;
+        }
+        /* one bulk alloc for the whole burst (own pool >> in-flight, so this rarely waits) */
+        while (rte_pktmbuf_alloc_bulk(mp, tx, n) != 0) {
             if (force_quit) { g_w_sent[qid] = sent; goto done; }
             rte_pause();
         }
@@ -301,6 +319,7 @@ int main(int argc, char **argv)
     g_nq = nqs ? atoi(nqs) : 1;
     if (g_nq < 1) g_nq = 1;
     if (g_nq > NQ_MAX) g_nq = NQ_MAX;
+    g_stub = getenv("STUB") ? atoi(getenv("STUB")) : 0;
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
@@ -314,13 +333,19 @@ int main(int argc, char **argv)
         rte_exit(EXIT_FAILURE, "NQ=%d needs %d lcores (reader+%d workers+main); have %u\n",
                  g_nq, g_nq + 2, g_nq, rte_lcore_count());
 
-    g_mp = rte_pktmbuf_pool_create("REPLAY_MP", NUM_MBUFS, MBUF_CACHE, 0,
-                                   MBUF_DATAROOM, rte_socket_id());
-    if (!g_mp) rte_exit(EXIT_FAILURE, "mbuf pool create failed\n");
+    g_mp_rx = rte_pktmbuf_pool_create("REPLAY_RX", NUM_MBUFS_RX, MBUF_CACHE, 0,
+                                      MBUF_DATAROOM, rte_socket_id());
+    if (!g_mp_rx) rte_exit(EXIT_FAILURE, "RX mbuf pool create failed\n");
+    for (int q = 0; q < g_nq; q++) {                 /* one TX pool per worker -> no shared-pool contention */
+        char nm[32]; snprintf(nm, sizeof(nm), "REPLAY_TX_%d", q);
+        g_mp_tx[q] = rte_pktmbuf_pool_create(nm, NUM_MBUFS_TX, MBUF_CACHE, 0,
+                                             MBUF_DATAROOM, rte_socket_id());
+        if (!g_mp_tx[q]) rte_exit(EXIT_FAILURE, "TX pool %d create failed\n", q);
+    }
 
-    if (port_init(PORT_TX, 1, g_nq, g_mp) < 0) rte_exit(EXIT_FAILURE, "port %d init\n", PORT_TX);
+    if (port_init(PORT_TX, 1, g_nq, g_mp_rx) < 0) rte_exit(EXIT_FAILURE, "port %d init\n", PORT_TX);
     printf("PF0 (TX) up, %d queue(s)\n", g_nq);
-    if (port_init(PORT_RX, 1, 1, g_mp) < 0) rte_exit(EXIT_FAILURE, "port %d init\n", PORT_RX);
+    if (port_init(PORT_RX, 1, 1, g_mp_rx) < 0) rte_exit(EXIT_FAILURE, "port %d init\n", PORT_RX);
     printf("PF1 (RX) up\n");
 
     for (int q = 0; q < g_nq; q++) {
@@ -357,6 +382,8 @@ int main(int argc, char **argv)
         printf("Recording aggregated frames -> %s\n", argv[2]);
     }
 
+    if (g_stub)
+        printf("STUB MODE: workers drop refs (no encap/TX) -- measuring reader+dispatch only\n");
     printf("Streaming %s (linktype %u) -> PF0 x%d, draining PF1...\n", path,
            g_swap ? rte_bswap32(gh.network) : gh.network, g_nq);
 
