@@ -9,9 +9,10 @@ aggregates many compact records into host-bound `0x88B5` frames via QDMA C2H.
 **Status — v3 (`version 0x03`, 32 B record):** built (timing **met**, WNS +0.045 ns),
 hardware-verified, and throughput-validated on the real datapath:
 - multi-queue **≥100 Mpps min-size, drop-free** (host/PCIe-limited; plugin ~163 Mpps in sim);
-- the full **60 GB real scan trace — all 1,073,741,824 packets — streamed drop-free**
-  (`drop_count=0`, tag OK, `frame_seq` contiguous), in one pass at **13.25 Mpps / 81 s** via
-  the lz4-in-RAM, multi-queue `graph_replay` streamer (≈4× the raw-HDD baseline).
+- the full **57 GB real scan trace — all 1,073,741,824 packets — streamed drop-free**
+  (`drop_count=0`, tag OK, `frame_seq` contiguous), in one pass at **15.20 Mpps / 70.7 s** via
+  the lz4-in-RAM, multi-queue `graph_replay` streamer (4.4× the raw-HDD baseline), paced by
+  the single reader core (~18 Mpps turbo, ~13.4 Mpps sustained after the CPU's power-limit step).
 
 > **Detailed, reproducible step-by-step guides live in the [wiki](../../wiki)** — this README
 > is the concise overview + pointers:
@@ -85,7 +86,7 @@ cd test
 NUMQ=8 ./onic_dpdk_reinit.sh                           # multi-queue steering + DPDK env
 # real trace at ~100 Mpps: split per queue, pktgen -s 0:mq_0.pcap,mq_1.pcap,...
 ./pcap_prep.py -i <trace>.pcap --split 8 --prefix /scratch/data/mq_ -n 1600000
-# whole 57 GB in one streaming pass at ~13 Mpps (lz4-in-RAM, every frame verified live):
+# whole 57 GB in one streaming pass at ~15 Mpps (lz4-in-RAM, every frame verified live):
 lz4 -1 /scratch/data/<trace>.pcap /scratch/data/trace.lz4   # compress once (kept on /scratch)
 cp /scratch/data/trace.lz4 /dev/shm/                        # stage in RAM once per boot
 make -f Makefile.graph_replay && NUMQ=4 HUGEPAGES=4096 ./onic_dpdk_reinit.sh
