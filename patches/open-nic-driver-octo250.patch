@@ -1,0 +1,64 @@
+diff --git a/onic_hardware.c b/onic_hardware.c
+index 0a91d6a..e1b32cc 100644
+--- a/onic_hardware.c
++++ b/onic_hardware.c
+@@ -196,9 +196,10 @@ static int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id)
+ 	if (cmac_id != 0 && cmac_id != 1)
+ 		return -EINVAL;
+ 
+-	/* Enable RS-FEC for CMACs with RS-FEC implemented */
+-	onic_write_reg(hw, CMAC_OFFSET_RSFEC_CONF_ENABLE(cmac_id), 0x3);
+-	onic_write_reg(hw, CMAC_OFFSET_RSFEC_CONF_IND_CORRECTION(cmac_id), 0x7);
++	/* octo250: the switch ports run WITHOUT RS-FEC. Enabling RS-FEC here
++	 * prevents RX PCS lock (verified: the link locks only with FEC disabled).
++	 * Keep RS-FEC off to match the link partner. */
++	onic_write_reg(hw, CMAC_OFFSET_RSFEC_CONF_ENABLE(cmac_id), 0x0);
+ 
+ 	if (cmac_id == 0) {
+ 		onic_write_reg(hw, SYSCFG_OFFSET_SHELL_RESET, 0x2);
+@@ -213,9 +214,16 @@ static int onic_enable_cmac(struct onic_hardware *hw, u8 cmac_id)
+ 	onic_write_reg(hw, CMAC_OFFSET_CONF_RX_1(cmac_id), 0x1);
+ 	onic_write_reg(hw, CMAC_OFFSET_CONF_TX_1(cmac_id), 0x10);
+ 
+-	/* wait for lane alignment */
+-	if (!onic_rx_lane_aligned(hw, cmac_id)) {
+-		mdelay(RX_ALIGN_TIMEOUT_MS);
++	/* wait for lane alignment — retry, RX PCS can take ~1s to lock.
++	 * msleep (not mdelay) so we yield the CPU instead of busy-waiting; this
++	 * runs in probe/process context, which is allowed to sleep. */
++	{
++		int align_tries;
++		for (align_tries = 0; align_tries < 50; align_tries++) {
++			if (onic_rx_lane_aligned(hw, cmac_id))
++				break;
++			msleep(100);
++		}
+ 		if (!onic_rx_lane_aligned(hw, cmac_id))
+ 			goto rx_not_aligned;
+ 	}
+diff --git a/onic_main.c b/onic_main.c
+index 62802be..51ed091 100644
+--- a/onic_main.c
++++ b/onic_main.c
+@@ -139,6 +139,21 @@ static int onic_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	int rv;
+ 	/* int pci_using_dac; */
+ 
++	/* An UNPROGRAMMED card's factory/golden flash image enumerates with the
++	 * same PCI device ID (0x903f) but as a "Serial controller" (PCI base class
++	 * 0x07), not a "Network controller" (0x02). Binding to those has no benefit
++	 * and is actively harmful: MSI-X allocation fails (onic_init_capacity
++	 * returns -ENOSPC/-28) and the half-initialised device can corrupt IRQ
++	 * state, which later shows up as page faults / soft-lockups (e.g. when
++	 * irqbalance walks /proc/interrupts). Only attach to real programmed
++	 * OpenNIC shells, which present as network controllers. */
++	if ((pdev->class >> 16) != PCI_BASE_CLASS_NETWORK) {
++		dev_info(&pdev->dev,
++			 "skipping device with class 0x%06x (not a programmed OpenNIC shell)\n",
++			 pdev->class);
++		return -ENODEV;
++	}
++
+ 	rv = pci_enable_device_mem(pdev);
+ 	if (rv < 0) {
+ 		dev_err(&pdev->dev, "pci_enable_device_mem, err = %d", rv);
