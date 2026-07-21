@@ -135,20 +135,20 @@ module p2p_250mhz #(
   end
   endgenerate
 
-  generate for (genvar i = 0; i < NUM_INTF; i++) begin
-    wire          [16*3-1:0] axis_adap_tx_250mhz_tuser;
-    wire          [16*3-1:0] axis_adap_rx_250mhz_tuser;
-    wire          [16*3*NUM_QDMA-1:0] axis_qdma_c2h_tuser;
+  generate if (NUM_QDMA > 1) begin : g_multi_qdma
+    for (genvar i = 0; i < NUM_INTF; i++) begin : g_intf
+      wire          [16*3-1:0] axis_adap_tx_250mhz_tuser;
+      wire          [16*3-1:0] axis_adap_rx_250mhz_tuser;
+      wire          [16*3*NUM_QDMA-1:0] axis_qdma_c2h_tuser;
 
-    assign axis_adap_rx_250mhz_tuser[0+:16]                 = s_axis_adap_rx_250mhz_tuser_size[`getvec(16, i)];
-    assign axis_adap_rx_250mhz_tuser[16+:16]                = s_axis_adap_rx_250mhz_tuser_src[`getvec(16, i)];
-    assign axis_adap_rx_250mhz_tuser[32+:16]                = s_axis_adap_rx_250mhz_tuser_dst[`getvec(16, i)];
+      assign axis_adap_rx_250mhz_tuser[0+:16]                 = s_axis_adap_rx_250mhz_tuser_size[`getvec(16, i)];
+      assign axis_adap_rx_250mhz_tuser[16+:16]                = s_axis_adap_rx_250mhz_tuser_src[`getvec(16, i)];
+      assign axis_adap_rx_250mhz_tuser[32+:16]                = s_axis_adap_rx_250mhz_tuser_dst[`getvec(16, i)];
 
-    assign m_axis_adap_tx_250mhz_tuser_size[`getvec(16, i)] = axis_adap_tx_250mhz_tuser[0+:16];
-    assign m_axis_adap_tx_250mhz_tuser_src[`getvec(16, i)]  = axis_adap_tx_250mhz_tuser[16+:16];
-    assign m_axis_adap_tx_250mhz_tuser_dst[`getvec(16, i)]  = 16'h1 << (6 + i);
+      assign m_axis_adap_tx_250mhz_tuser_size[`getvec(16, i)] = axis_adap_tx_250mhz_tuser[0+:16];
+      assign m_axis_adap_tx_250mhz_tuser_src[`getvec(16, i)]  = axis_adap_tx_250mhz_tuser[16+:16];
+      assign m_axis_adap_tx_250mhz_tuser_dst[`getvec(16, i)]  = 16'h1 << (6 + i);
 
-    if (NUM_QDMA > 1) begin
       wire      [NUM_QDMA-1:0] axis_qdma_h2c_tvalid;
       wire  [512*NUM_QDMA-1:0] axis_qdma_h2c_tdata;
       wire   [64*NUM_QDMA-1:0] axis_qdma_h2c_tkeep;
@@ -252,7 +252,106 @@ module p2p_250mhz #(
         .s_axi_ctrl_rresp    (s_axil_rresp[`getvec(2, 2*i)])
       );
     end
-    else begin
+  end
+  else begin : g_single_qdma
+    if (NUM_INTF >= 2) begin : g_bump_in_wire
+      // ==================================================================
+      // Graph plugin v4 -- "bump in the wire"
+      //   CMAC port 0 RX  ->  graph_aggregator  ->  CMAC port 1 TX
+      //
+      // Ingress IPv4 packets on CMAC port 0 are extracted and aggregated
+      // into a 0x88B5 result frame that is sent back out CMAC port 1
+      // (network egress) toward a third machine -- instead of up to the
+      // local host via QDMA C2H. One-way only; CMAC port 1 RX and the host
+      // TX (H2C) path out CMAC port 0 are left available.
+      // ==================================================================
+
+      // Host RX (C2H) is unused on this device -- tie the whole bus off.
+      assign m_axis_qdma_c2h_tvalid     = {NUM_INTF*NUM_QDMA{1'b0}};
+      assign m_axis_qdma_c2h_tdata      = {512*NUM_INTF*NUM_QDMA{1'b0}};
+      assign m_axis_qdma_c2h_tkeep      = {64*NUM_INTF*NUM_QDMA{1'b0}};
+      assign m_axis_qdma_c2h_tlast      = {NUM_INTF*NUM_QDMA{1'b0}};
+      assign m_axis_qdma_c2h_tuser_size = {16*NUM_INTF*NUM_QDMA{1'b0}};
+      assign m_axis_qdma_c2h_tuser_src  = {16*NUM_INTF*NUM_QDMA{1'b0}};
+      assign m_axis_qdma_c2h_tuser_dst  = {16*NUM_INTF*NUM_QDMA{1'b0}};
+
+      // ---- CMAC port 0 TX: keep host H2C pass-through (harmless) --------
+      wire [16*3-1:0] axis_qdma_h2c_tuser0;
+      assign axis_qdma_h2c_tuser0[0+:16]  = s_axis_qdma_h2c_tuser_size[`getvec(16, 0)];
+      assign axis_qdma_h2c_tuser0[16+:16] = s_axis_qdma_h2c_tuser_src[`getvec(16, 0)];
+      assign axis_qdma_h2c_tuser0[32+:16] = s_axis_qdma_h2c_tuser_dst[`getvec(16, 0)];
+
+      wire [16*3-1:0] axis_adap_tx0_tuser;
+      assign m_axis_adap_tx_250mhz_tuser_size[`getvec(16, 0)] = axis_adap_tx0_tuser[0+:16];
+      assign m_axis_adap_tx_250mhz_tuser_src[`getvec(16, 0)]  = axis_adap_tx0_tuser[16+:16];
+      assign m_axis_adap_tx_250mhz_tuser_dst[`getvec(16, 0)]  = 16'h1 << (6 + 0);  // CMAC0
+
+      axi_stream_pipeline tx_ppl_inst (
+        .s_axis_tvalid (s_axis_qdma_h2c_tvalid[0]),
+        .s_axis_tdata  (s_axis_qdma_h2c_tdata[`getvec(512, 0)]),
+        .s_axis_tkeep  (s_axis_qdma_h2c_tkeep[`getvec(64, 0)]),
+        .s_axis_tlast  (s_axis_qdma_h2c_tlast[0]),
+        .s_axis_tuser  (axis_qdma_h2c_tuser0),
+        .s_axis_tready (s_axis_qdma_h2c_tready[0]),
+
+        .m_axis_tvalid (m_axis_adap_tx_250mhz_tvalid[0]),
+        .m_axis_tdata  (m_axis_adap_tx_250mhz_tdata[`getvec(512, 0)]),
+        .m_axis_tkeep  (m_axis_adap_tx_250mhz_tkeep[`getvec(64, 0)]),
+        .m_axis_tlast  (m_axis_adap_tx_250mhz_tlast[0]),
+        .m_axis_tuser  (axis_adap_tx0_tuser),
+        .m_axis_tready (m_axis_adap_tx_250mhz_tready[0]),
+
+        .aclk          (axis_aclk),
+        .aresetn       (axil_aresetn)
+      );
+
+      // ---- CMAC port 1 TX: driven by the aggregator (network egress) ---
+      wire [15:0] aggr_frame_size;
+      assign m_axis_adap_tx_250mhz_tuser_size[`getvec(16, 1)] = aggr_frame_size;
+      assign m_axis_adap_tx_250mhz_tuser_src[`getvec(16, 1)]  = 16'h1 << (6 + 0);  // origin CMAC0
+      assign m_axis_adap_tx_250mhz_tuser_dst[`getvec(16, 1)]  = 16'h1 << (6 + 1);  // CMAC1
+
+      graph_aggregator #(
+        .FLUSH_TIMEOUT_CYCLES (AGGR_FLUSH_TIMEOUT),
+        // Egress dst MAC = sink card C (bus c1) receiving port enp193s0f0.
+        // Directed unicast; the SONiC switch forwards it to that port.
+        .ETH_DST_MAC          (48'h00_0A_35_A8_97_D2)
+      ) graph_aggr_inst (
+        .s_axis_tvalid     (s_axis_adap_rx_250mhz_tvalid[0]),
+        .s_axis_tdata      (s_axis_adap_rx_250mhz_tdata[`getvec(512, 0)]),
+        .s_axis_tkeep      (s_axis_adap_rx_250mhz_tkeep[`getvec(64, 0)]),
+        .s_axis_tlast      (s_axis_adap_rx_250mhz_tlast[0]),
+        .s_axis_tready     (s_axis_adap_rx_250mhz_tready[0]),
+
+        .m_axis_tvalid     (m_axis_adap_tx_250mhz_tvalid[1]),
+        .m_axis_tdata      (m_axis_adap_tx_250mhz_tdata[`getvec(512, 1)]),
+        .m_axis_tkeep      (m_axis_adap_tx_250mhz_tkeep[`getvec(64, 1)]),
+        .m_axis_tlast      (m_axis_adap_tx_250mhz_tlast[1]),
+        .m_axis_tuser_size (aggr_frame_size),
+        .m_axis_tready     (m_axis_adap_tx_250mhz_tready[1]),
+
+        .drop_count        (),
+        .frame_count       (),
+
+        .aclk              (axis_aclk),
+        .aresetn           (axil_aresetn)
+      );
+
+      // ---- Unused streams: drain so upstream never stalls --------------
+      assign s_axis_adap_rx_250mhz_tready[1] = 1'b1;  // CMAC port 1 RX drained
+      assign s_axis_qdma_h2c_tready[1]       = 1'b1;  // host H2C on PF1 drained
+    end
+    else begin : g_host_delivery
+      // Fallback (NUM_INTF < 2): original network-ingress -> host (C2H)
+      // aggregation, one aggregator per port.
+      for (genvar i = 0; i < NUM_INTF; i++) begin : g_intf
+      wire [16*3-1:0] axis_adap_tx_250mhz_tuser;
+      wire [16*3-1:0] axis_qdma_c2h_tuser;
+
+      assign m_axis_adap_tx_250mhz_tuser_size[`getvec(16, i)] = axis_adap_tx_250mhz_tuser[0+:16];
+      assign m_axis_adap_tx_250mhz_tuser_src[`getvec(16, i)]  = axis_adap_tx_250mhz_tuser[16+:16];
+      assign m_axis_adap_tx_250mhz_tuser_dst[`getvec(16, i)]  = 16'h1 << (6 + i);
+
       wire [47:0] axis_qdma_h2c_tuser;
 
       assign axis_qdma_h2c_tuser[0+:16]                       = s_axis_qdma_h2c_tuser_size[`getvec(16, i)];
@@ -312,6 +411,7 @@ module p2p_250mhz #(
         .aclk              (axis_aclk),
         .aresetn           (axil_aresetn)
       );
+      end
     end
   end
   endgenerate

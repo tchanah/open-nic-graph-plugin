@@ -1,19 +1,24 @@
 """Cocotb tests for the graph plugin (p2p_250mhz with graph_aggregator).
 
-RX path (network ingress -> host): packets sent into s_axis_adap_rx are
-parsed; each IPv4 packet yields one 32-byte record (v3 layout, big-endian)
+v4 = "bump in the wire": CMAC port 0 RX packets are extracted/aggregated and
+the result frame is emitted OUT CMAC port 1 TX (network egress) instead of up
+to the host via QDMA C2H. So the aggregated output is read from the port-1 TX
+egress sink (``sink_tx[1]``), and QDMA C2H is unused (tied off).
+
+Ingress path (port 0 RX -> port 1 TX): packets sent into s_axis_adap_rx port 0
+are parsed; each IPv4 packet yields one 32-byte record (layout, big-endian)
     REC_FIXED(8) srcIP(8) dstIP(8) protoCode|sPort(2) flagsCode|dPort(2) pktLen(4)
-packed into host-bound frames (32-byte prefix = 1 aligned slot):
-    bytes 0..13  Ethernet header (DST_MAC, SRC_MAC, ETH_TYPE=0x88B5)
+packed into egress frames (32-byte prefix = 1 aligned slot):
+    bytes 0..13  Ethernet header (DST_MAC=sink enp193s0f0, SRC_MAC, ETH_TYPE=0x88B5)
     bytes 14..15 record count K (big-endian)
     bytes 16..19 drop_count   bytes 20..23 frame_seq
-    byte  24     flags (bit0 partial, bit1 drops)   byte 25 version (0x03)
+    byte  24     flags (bit0 partial, bit1 drops)   byte 25 version (0x04)
     bytes 26..31 reserved
     bytes 32..   K x 32-byte records
 A frame flushes at MAX_RECORDS (45) or after the idle timeout
 (AGGR_FLUSH_TIMEOUT=256 cycles in the sim wrapper).
 
-TX path (host -> network) remains pass-through and is checked unchanged.
+CMAC port 0 TX still carries host H2C as pass-through (checked unchanged).
 """
 
 import itertools
@@ -29,12 +34,14 @@ from cocotbext.axi import (AxiLiteBus, AxiLiteMaster, AxiStreamBus,
 from scapy.all import ARP, ICMP, IP, TCP, UDP, Ether
 
 AGG_ETH_TYPE = 0x88B5
-AGG_DST_MAC = bytes.fromhex('021122334455')
+# Egress dst MAC. Must match graph_aggregator.sv ETH_DST_MAC -- the sink card C
+# (bus c1) receiving port enp193s0f0. Change both together if the sink changes.
+AGG_DST_MAC = bytes.fromhex('000a35a897d2')
 AGG_SRC_MAC = bytes.fromhex('02aabbccddee')
 PREFIX_LEN = 32
 RECORD_LEN = 32
 MAX_RECORDS = 45
-HDR_VERSION = 3
+HDR_VERSION = 4
 REC_FIXED = bytes.fromhex("8100FD0000000001")  # MsgHdr tag, record bytes 0-7 (matches graph_aggregator.sv)
 
 # UDP packet with 128B payload (TX pass-through check)
@@ -292,12 +299,12 @@ async def run_test(dut, idle_inserter=None, backpressure_inserter=None):
     tb.set_idle_generator(idle_inserter)
     tb.set_backpressure_generator(backpressure_inserter)
 
-    # TX path (host -> network) is still pass-through
+    # CMAC port 0 TX still carries host H2C as pass-through
     await check_passthrough(tb, tb.source_tx[0], tb.sink_tx[0], PACKET)
-    await check_passthrough(tb, tb.source_tx[1], tb.sink_tx[1], PACKET)
 
-    # RX path (network -> host) aggregates: 200 packets = four full frames
-    # of 45 records plus a 20-record tail flushed by the idle timeout
+    # Ingress path (port 0 RX -> port 1 TX egress) aggregates: 200 packets =
+    # four full frames of 45 records plus a 20-record tail flushed by the idle
+    # timeout. The aggregated frames egress on CMAC port 1 TX (sink_tx[1]).
     n_pkts = 200
     pkts = [make_ipv4_pkt(i) for i in range(n_pkts)]
     expected = [expected_record(p) for p in pkts]
@@ -305,14 +312,8 @@ async def run_test(dut, idle_inserter=None, backpressure_inserter=None):
     for pkt in pkts:
         await tb.source_rx[0].send(AxiStreamFrame(bytes(pkt), tuser=0))
 
-    records = await collect_records(tb.log, tb.sink_rx[0], n_pkts)
+    records = await collect_records(tb.log, tb.sink_tx[1], n_pkts)
     assert records == expected, 'aggregated records mismatch'
-
-    # Both interfaces carry an aggregator: same check on port 1
-    for pkt in pkts[:8]:
-        await tb.source_rx[1].send(AxiStreamFrame(bytes(pkt), tuser=0))
-    records = await collect_records(tb.log, tb.sink_rx[1], 8)
-    assert records == expected[:8], 'port1 aggregated records mismatch'
 
     await RisingEdge(dut.axis_aclk)
     await RisingEdge(dut.axis_aclk)
@@ -338,7 +339,7 @@ async def run_test_filtering(dut):
     for pkt in sent:
         await tb.source_rx[0].send(AxiStreamFrame(bytes(pkt), tuser=0))
 
-    records = await collect_records(tb.log, tb.sink_rx[0], len(expected))
+    records = await collect_records(tb.log, tb.sink_tx[1], len(expected))
     assert records == expected, 'filtering records mismatch'
 
     # v3 record: proto/flags are 4-bit codes in the high nibble of bytes 24/26;
@@ -410,7 +411,7 @@ async def run_test_overflow(dut):
         await tb.source_rx[0].send(AxiStreamFrame(bytes(pkt), tuser=0))
 
     records, final_drop, drop_seen = await collect_records(
-        tb.log, tb.sink_rx[0], n_pkts, allow_drops=True)
+        tb.log, tb.sink_tx[1], n_pkts, allow_drops=True)
 
     tb.log.info('Overflow test: sent=%d delivered=%d dropped=%d',
                 n_pkts, len(records), final_drop)
@@ -498,7 +499,7 @@ async def run_test_sustained(dut, case=SUSTAINED_CASES[0]):
 
     if case['expect_drops']:
         records, final_drop, drop_seen = await collect_records(
-            tb.log, tb.sink_rx[0], n, allow_drops=True)
+            tb.log, tb.sink_tx[1], n, allow_drops=True)
         tb.log.info('Sustained[%s]: sent=%d delivered=%d dropped=%d',
                     case['label'], n, len(records), final_drop)
         assert len(records) + final_drop == n, \
@@ -517,7 +518,7 @@ async def run_test_sustained(dut, case=SUSTAINED_CASES[0]):
             '{}: delivered records not an in-order subsequence'.format(
                 case['label'])
     else:
-        records = await collect_records(tb.log, tb.sink_rx[0], n)
+        records = await collect_records(tb.log, tb.sink_tx[1], n)
         tb.log.info('Sustained[%s]: sent=%d delivered=%d dropped=0 (drop-free)',
                     case['label'], n, len(records))
         assert records == expected, \

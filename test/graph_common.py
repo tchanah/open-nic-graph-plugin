@@ -21,7 +21,7 @@ ETH_TYPE = 0x88B5
 PREFIX_LEN = 32
 RECORD_LEN = 32
 MAX_RECORDS = 45
-HDR_VERSION = 3
+HDR_VERSION = 4  # v4 = bump-in-wire (network egress); matches graph_aggregator.sv
 REC_FIXED = bytes.fromhex("8100FD0000000001")  # MsgHdr tag, record bytes 0-7 (matches graph_aggregator.sv)
 
 # Fixed L2 addresses for the injected (original) packets. Irrelevant to the

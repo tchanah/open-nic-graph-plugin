@@ -89,7 +89,7 @@ module graph_aggregator #(
   localparam int   MAX_BEATS    = (PREFIX_LEN + RECORD_LEN*MAX_RECORDS + 63)/64; // 23
   localparam int   FIFO_AW      = $clog2(RECORD_FIFO_DEPTH);
   localparam int   IDLE_W       = $clog2(FLUSH_TIMEOUT_CYCLES + 1);
-  localparam [7:0] HDR_VERSION  = 8'h03;
+  localparam [7:0] HDR_VERSION  = 8'h04;  // v4 = bump-in-wire (network egress)
 
   // -----------------------------------------------------------------------
   // Extractor: 5-tuple from the first beat of each packet
