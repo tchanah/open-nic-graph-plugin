@@ -39,9 +39,15 @@ if ! lsmod | grep -q '^vfio_pci'; then
     echo "Loading vfio-pci..."
     sudo modprobe vfio-pci
 fi
-if [ "$(cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null)" != "Y" ]; then
-    echo "Enabling vfio no-IOMMU mode (IOMMU is off on this host)..."
-    echo 1 | sudo tee /sys/module/vfio/parameters/enable_unsafe_noiommu_mode >/dev/null
+# Only enable vfio's no-IOMMU (unsafe) mode when the host has NO IOMMU (uno250).
+# octo250 runs AMD-Vi ON -> use normal IOMMU-backed vfio, so skip it there.
+if [ -z "$(ls -A /sys/class/iommu 2>/dev/null)" ]; then
+    if [ "$(cat /sys/module/vfio/parameters/enable_unsafe_noiommu_mode 2>/dev/null)" != "Y" ]; then
+        echo "No IOMMU present -> enabling vfio no-IOMMU (unsafe) mode..."
+        echo 1 | sudo tee /sys/module/vfio/parameters/enable_unsafe_noiommu_mode >/dev/null
+    fi
+else
+    echo "IOMMU present -> using normal IOMMU-backed vfio (no-IOMMU mode not enabled)."
 fi
 HP=/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
 if [ "$HUGEPAGES" != "0" ] && [ "$(cat "$HP" 2>/dev/null || echo 0)" -lt "$HUGEPAGES" ]; then

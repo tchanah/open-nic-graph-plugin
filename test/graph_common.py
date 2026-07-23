@@ -24,10 +24,14 @@ MAX_RECORDS = 45
 HDR_VERSION = 4  # v4 = bump-in-wire (network egress); matches graph_aggregator.sv
 REC_FIXED = bytes.fromhex("8100FD0000000001")  # MsgHdr tag, record bytes 0-7 (matches graph_aggregator.sv)
 
-# Fixed L2 addresses for the injected (original) packets. Irrelevant to the
-# plugin (it only reads L3/L4), but kept constant for reproducibility.
+# Fixed L2 addresses for the injected (original) packets. The plugin ignores L2
+# (it gates on EtherType 0x0800), but the SWITCH does not: INJ_DST_MAC must be a
+# real UNICAST MAC pinned on the plugin card's ingress port (octo250: Card B
+# enp129s0f0), else the frame is flooded to every VLAN port. The old
+# 11:22:33:44:55:66 had the I/G bit set (0x11 -> multicast) so it always flooded --
+# invisible on uno250's back-to-back cable. Keep in sync with graph_replay.c DST_MAC.
 INJ_SRC_MAC = "aa:bb:cc:dd:ee:ff"
-INJ_DST_MAC = "11:22:33:44:55:66"
+INJ_DST_MAC = "02:00:00:00:00:b0"
 
 
 def _ips(i):

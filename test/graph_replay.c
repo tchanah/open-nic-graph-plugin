@@ -66,12 +66,17 @@
 
 /* Must match graph_aggregator.sv / graph_common.py. */
 #define ETH_TYPE_AGG   0x88B5
-#define HDR_VERSION    0x03
+#define HDR_VERSION    0x04            /* v4 = bump-in-wire */
 #define RECORD_LEN     32
 #define PREFIX_LEN     32
 static const uint8_t REC_FIXED[8] = {0x81,0x00,0xFD,0x00,0x00,0x00,0x00,0x01};
-/* Injected L2 addrs (plugin ignores L2; kept consistent with the python tooling). */
-static const uint8_t DST_MAC[6] = {0x11,0x22,0x33,0x44,0x55,0x66};
+/* Injected L2 addrs (the plugin ignores L2 -- it gates on EtherType 0x0800 only -- but the
+ * SWITCH does not: this must be a real UNICAST MAC pinned on the plugin card's ingress port,
+ * or the frame is flooded to every VLAN port. The old 11:22:33:44:55:66 has the I/G bit set
+ * (0x11 -> multicast) so it flooded by definition; harmless on uno250's back-to-back cable,
+ * a billion flooded packets on octo250's switch. Pin B port0 to this and arping so the
+ * switch learns it. Keep in sync with graph_common.py INJ_DST_MAC. */
+static const uint8_t DST_MAC[6] = {0x02,0x00,0x00,0x00,0x00,0xb0};
 static const uint8_t SRC_MAC[6] = {0xaa,0xbb,0xcc,0xdd,0xee,0xff};
 
 /* classic pcap headers */
@@ -92,6 +97,7 @@ static uint8_t           *g_blk[NBLK];     /* reader's stdin parse buffers */
 static int                g_blk_out[NBLK]; /* outstanding refs per block (atomic) */
 static int                g_nq = 1;
 static int                g_stub = 0;      /* STUB=1: workers drop refs w/o encap+TX (reader isolation) */
+static int                g_txonly = 0;    /* TXONLY=1: 3-card path -- TX only, no PF1 RX/verify (results land on Card C) */
 static int                g_swap = 0;
 static volatile int       g_reader_done = 0;
 static volatile int       g_workers_live = 0;
@@ -320,12 +326,14 @@ int main(int argc, char **argv)
     if (g_nq < 1) g_nq = 1;
     if (g_nq > NQ_MAX) g_nq = NQ_MAX;
     g_stub = getenv("STUB") ? atoi(getenv("STUB")) : 0;
+    g_txonly = getenv("TXONLY") ? atoi(getenv("TXONLY")) : 0;
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
 
-    if (rte_eth_dev_count_avail() < 2)
-        rte_exit(EXIT_FAILURE, "need 2 ports (PF0 TX, PF1 RX)\n");
+    if (rte_eth_dev_count_avail() < (g_txonly ? 1u : 2u))
+        rte_exit(EXIT_FAILURE, "need %d port(s)%s\n",
+                 g_txonly ? 1 : 2, g_txonly ? " (PF0 TX only)" : " (PF0 TX, PF1 RX)");
 
     /* need 1 reader + g_nq workers on worker lcores, plus the main lcore for RX */
     unsigned nworker_lc = rte_lcore_count() - 1;
@@ -345,8 +353,12 @@ int main(int argc, char **argv)
 
     if (port_init(PORT_TX, 1, g_nq, g_mp_rx) < 0) rte_exit(EXIT_FAILURE, "port %d init\n", PORT_TX);
     printf("PF0 (TX) up, %d queue(s)\n", g_nq);
-    if (port_init(PORT_RX, 1, 1, g_mp_rx) < 0) rte_exit(EXIT_FAILURE, "port %d init\n", PORT_RX);
-    printf("PF1 (RX) up\n");
+    if (!g_txonly) {
+        if (port_init(PORT_RX, 1, 1, g_mp_rx) < 0) rte_exit(EXIT_FAILURE, "port %d init\n", PORT_RX);
+        printf("PF1 (RX) up\n");
+    } else {
+        printf("TXONLY: no PF1 RX (3-card path -- results land on Card C)\n");
+    }
 
     for (int q = 0; q < g_nq; q++) {
         char nm[32]; snprintf(nm, sizeof(nm), "REF_RING_%d", q);
@@ -405,7 +417,7 @@ int main(int argc, char **argv)
 
     /* MAIN lcore: drain + verify C2H while the workers TX */
     while (__atomic_load_n(&g_workers_live, __ATOMIC_ACQUIRE) > 0 && !force_quit) {
-        drain_rx();
+        if (!g_txonly) drain_rx();
         uint64_t now = rte_get_timer_cycles();
         if (now - tlast > 2 * hz) {
             uint64_t sent = 0;
@@ -418,10 +430,12 @@ int main(int argc, char **argv)
     }
 
     /* flush the tail: drain until the C2H frames stop arriving (idle-timeout flush) */
-    uint64_t idle_start = rte_get_timer_cycles(), prev_frames = st_frames;
-    while (rte_get_timer_cycles() - idle_start < 2 * hz) {
-        drain_rx();
-        if (st_frames != prev_frames) { prev_frames = st_frames; idle_start = rte_get_timer_cycles(); }
+    if (!g_txonly) {
+        uint64_t idle_start = rte_get_timer_cycles(), prev_frames = st_frames;
+        while (rte_get_timer_cycles() - idle_start < 2 * hz) {
+            drain_rx();
+            if (st_frames != prev_frames) { prev_frames = st_frames; idle_start = rte_get_timer_cycles(); }
+        }
     }
     rte_eal_mp_wait_lcore();
     if (f != stdin) fclose(f);
@@ -436,12 +450,20 @@ int main(int argc, char **argv)
            st_frames ? (double)st_sent / st_frames : 0.0);
     printf("max drop_count    : %u\n", st_max_drop);
     printf("tag mismatches    : %" PRIu64 "\n", st_tag_bad);
-    printf("version != 0x03   : %" PRIu64 "\n", st_ver_bad);
+    printf("version != 0x04   : %" PRIu64 "\n", st_ver_bad);
     printf("frame_seq gaps    : %" PRIu64 "\n", st_seq_gaps);
     printf("elapsed / rate    : %.1f s  /  %.2f Mpps\n", secs, st_sent / secs / 1e6);
     if (out_f) { fclose(out_f); printf("frames -> pcap    : %s\n", "written"); }
-    int ok = (st_max_drop == 0 && st_tag_bad == 0 && st_ver_bad == 0);
-    printf("RESULT: %s\n", ok ? "PASS (drop-free, tag OK, v3)" : "CHECK (see nonzero counters)");
-    rte_eth_dev_stop(PORT_TX); rte_eth_dev_stop(PORT_RX);
+    int ok;
+    if (g_txonly) {
+        printf("(TXONLY: no local RX -- verify frames/drop_count at Card C: cmac_pktcount + tcpdump -s 64)\n");
+        ok = (st_sent > 0);
+        printf("RESULT: %s\n", ok ? "TX DONE (verify at Card C)" : "CHECK (nothing sent)");
+    } else {
+        ok = (st_max_drop == 0 && st_tag_bad == 0 && st_ver_bad == 0);
+        printf("RESULT: %s\n", ok ? "PASS (drop-free, tag OK, v4)" : "CHECK (see nonzero counters)");
+    }
+    rte_eth_dev_stop(PORT_TX);
+    if (!g_txonly) rte_eth_dev_stop(PORT_RX);
     return ok ? 0 : 1;
 }
